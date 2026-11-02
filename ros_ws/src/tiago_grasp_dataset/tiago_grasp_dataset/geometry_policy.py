@@ -34,6 +34,7 @@ class GeometryContactPolicy:
         finger_pad_z_correction=-0.012,
         finger_pad_forward_offset=0.045,
         finger_pad_half_height=0.025,
+        gripper_body_vertical_half_extent=0.039,
     ):
         self.random = random_generator
         self.fingertip_width = float(fingertip_width)
@@ -43,6 +44,9 @@ class GeometryContactPolicy:
         self.finger_pad_z_correction = float(finger_pad_z_correction)
         self.finger_pad_forward_offset = float(finger_pad_forward_offset)
         self.finger_pad_half_height = float(finger_pad_half_height)
+        self.gripper_body_vertical_half_extent = float(
+            gripper_body_vertical_half_extent
+        )
 
     def compute(self, object_info):
         points, normals, curvature = self.sample_cloud(object_info)
@@ -59,10 +63,26 @@ class GeometryContactPolicy:
         closing_axis /= max(np.linalg.norm(closing_axis), 1e-9)
 
         plane_distance = np.abs((points - centroid) @ main_axis)
-        cutting_indices = np.flatnonzero(plane_distance <= 0.007)
+        object_center_z = (
+            float(object_info["table_height"])
+            + float(object_info["geometry"]["center_height"])
+        )
+        grasp_plane_z = max(
+            object_center_z + self.finger_pad_z_correction,
+            float(object_info["table_height"])
+            + self.gripper_body_vertical_half_extent
+            + 0.026,
+        )
+        # The PAL gripper closes in the horizontal plane. Restrict both
+        # contacts to an equatorial slice so a sphere cannot yield a diagonal
+        # top-to-bottom pair that the two fingers cannot realize.
+        cutting_indices = np.flatnonzero(
+            np.abs(points[:, 2] - grasp_plane_z) <= 0.007
+        )
         if cutting_indices.size < 40:
-            threshold = float(np.quantile(plane_distance, 0.20))
-            cutting_indices = np.flatnonzero(plane_distance <= threshold)
+            cutting_indices = np.argsort(
+                np.abs(points[:, 2] - grasp_plane_z)
+            )[:40]
         cutting_points = points[cutting_indices]
         projection = (cutting_points - centroid) @ closing_axis
         first_seed = cutting_points[int(np.argmin(projection))]
@@ -95,6 +115,12 @@ class GeometryContactPolicy:
                 connector = second - first
                 separation = float(np.linalg.norm(connector))
                 if separation <= 1e-6 or separation > self.gripper_max_width:
+                    continue
+                if (
+                    abs(float(first[2] - grasp_plane_z)) > 0.009
+                    or abs(float(second[2] - grasp_plane_z)) > 0.009
+                    or abs(float(connector[2])) > 0.008
+                ):
                     continue
                 connector /= separation
                 antipodal_first = abs(float(np.dot(normals[first_index], connector)))
@@ -131,21 +157,24 @@ class GeometryContactPolicy:
         # Use the object's physical centre rather than the height of a random
         # sampled contact pair.  Dynamic objects settle from their 3 mm spawn
         # clearance onto this exact height before an episode begins.
-        target[2] = (
-            float(object_info["table_height"])
-            + float(object_info["geometry"]["center_height"])
-            + self.finger_pad_z_correction
-        )
-        target[2] = max(
-            float(object_info["table_height"])
-            + self.finger_pad_half_height
-            + 0.001,
-            target[2],
-        )
-        pregrasp = target - approach * self.pregrasp_distance
+        target[2] = grasp_plane_z
+        # Descend onto the side-grasp pose from above. Sweeping the PAL
+        # gripper's 110 mm finger boxes horizontally can push tall cups and
+        # cans before they enter the open finger gap.
+        pregrasp = target.copy()
+        pregrasp[2] += self.pregrasp_distance
         lift = target.copy()
         lift[2] += self.lift_distance
         yaw = math.atan2(float(approach[1]), float(approach[0]))
+        gripper_contact_width = separation
+        if object_info["geometry"]["shape"] == "sphere":
+            # The 50 mm-tall pads overlap the sphere's equator even though the
+            # selected contact points lie in the elevated collision-free
+            # grasp plane. The closing command must therefore use the full
+            # sphere diameter.
+            gripper_contact_width = 2.0 * float(
+                object_info["geometry"]["half_width"]
+            )
 
         return {
             "name": "pca_antipodal_two_finger",
@@ -161,7 +190,8 @@ class GeometryContactPolicy:
                 vector_list(normals[first_index]),
                 vector_list(normals[second_index]),
             ],
-            "contact_separation": float(separation),
+            "contact_separation": float(gripper_contact_width),
+            "sampled_contact_separation": float(separation),
             "rank_score": float(score),
             "pregrasp_pose": pose_dict(pregrasp, yaw),
             "grasp_pose": pose_dict(target, yaw),
@@ -175,6 +205,7 @@ class GeometryContactPolicy:
                 "finger_pad_z_correction": self.finger_pad_z_correction,
                 "finger_pad_forward_offset": self.finger_pad_forward_offset,
                 "finger_pad_half_height": self.finger_pad_half_height,
+                "gripper_body_vertical_half_extent": self.gripper_body_vertical_half_extent,
             },
         }
 

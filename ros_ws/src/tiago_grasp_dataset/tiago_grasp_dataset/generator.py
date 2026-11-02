@@ -650,7 +650,7 @@ class HeuristicRecorder:
             trajectory.points.append(point)
         goal = FollowJointTrajectory.Goal(trajectory=trajectory)
         goal_future = client.send_goal_async(goal)
-        timeout = max(15.0, segment["points"][-1]["time_from_start"] + 12.0)
+        timeout = max(30.0, segment["points"][-1]["time_from_start"] + 25.0)
         deadline = time.monotonic() + timeout
         while not goal_future.done() and time.monotonic() < deadline:
             time.sleep(0.05)

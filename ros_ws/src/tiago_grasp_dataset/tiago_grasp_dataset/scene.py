@@ -17,7 +17,7 @@ from std_srvs.srv import Trigger
 TABLE_HEIGHT = 0.55
 OBJECT_TYPES = ("apple", "cup", "can")
 OBJECT_GEOMETRY = {
-    "apple": {"shape": "sphere", "half_width": 0.038, "center_height": 0.038},
+    "apple": {"shape": "sphere", "half_width": 0.032, "center_height": 0.032},
     "cup": {"shape": "cylinder", "half_width": 0.032, "center_height": 0.0475},
     "can": {"shape": "cylinder", "half_width": 0.028, "center_height": 0.0575},
 }
@@ -106,9 +106,9 @@ def object_sdf(kind, name, color):
     surface = surface_xml()
     if kind == "apple":
         geometry = f"""
-      <collision name='body_collision'><geometry><sphere><radius>0.038</radius></sphere></geometry>{surface}</collision>
-      <visual name='body_visual'><geometry><sphere><radius>0.038</radius></sphere></geometry><material><ambient>{material}</ambient><diffuse>{material}</diffuse></material></visual>
-      <visual name='stem_visual'><pose>0 0 0.043 0 0 0</pose><geometry><cylinder><radius>0.004</radius><length>0.022</length></cylinder></geometry><material><ambient>0.20 0.09 0.03 1</ambient><diffuse>0.28 0.12 0.04 1</diffuse></material></visual>"""
+      <collision name='body_collision'><geometry><sphere><radius>0.032</radius></sphere></geometry>{surface}</collision>
+      <visual name='body_visual'><geometry><sphere><radius>0.032</radius></sphere></geometry><material><ambient>{material}</ambient><diffuse>{material}</diffuse></material></visual>
+      <visual name='stem_visual'><pose>0 0 0.037 0 0 0</pose><geometry><cylinder><radius>0.0035</radius><length>0.020</length></cylinder></geometry><material><ambient>0.20 0.09 0.03 1</ambient><diffuse>0.28 0.12 0.04 1</diffuse></material></visual>"""
         mass = 0.12
     elif kind == "cup":
         geometry = f"""
@@ -171,24 +171,29 @@ class GazeboScene:
         self.node.get_logger().info(f"Removed {name}")
 
     def pose(self, name):
-        result = subprocess.run(
-            ["gz", "model", "-m", name, "-p"],
-            capture_output=True,
-            text=True,
-            timeout=15,
-        )
-        if result.returncode != 0:
-            raise RuntimeError(
-                f"Unable to read pose for {name}: {result.stderr or result.stdout}"
+        command = ["gz", "model", "-m", name, "-p"]
+        result = None
+        match = None
+        for attempt in range(5):
+            result = subprocess.run(
+                command, capture_output=True, text=True, timeout=15
             )
-        match = re.search(
-            r"Pose \[ XYZ \(m\) \] \[ RPY \(rad\) \]:\s*"
-            r"\[\s*([-+0-9.eE]+)\s+([-+0-9.eE]+)\s+([-+0-9.eE]+)\s*\]\s*"
-            r"\[\s*([-+0-9.eE]+)\s+([-+0-9.eE]+)\s+([-+0-9.eE]+)\s*\]",
-            result.stdout,
-        )
+            if result.returncode == 0:
+                match = re.search(
+                    r"Pose \[ XYZ \(m\) \] \[ RPY \(rad\) \]:\s*"
+                    r"\[\s*([-+0-9.eE]+)\s+([-+0-9.eE]+)\s+([-+0-9.eE]+)\s*\]\s*"
+                    r"\[\s*([-+0-9.eE]+)\s+([-+0-9.eE]+)\s+([-+0-9.eE]+)\s*\]",
+                    result.stdout,
+                )
+                if match is not None:
+                    break
+            if attempt < 4:
+                time.sleep(0.2)
         if match is None:
-            raise RuntimeError(f"Pose output for {name} was not understood")
+            output = (result.stderr or result.stdout).strip() if result else ""
+            raise RuntimeError(
+                f"Unable to read pose for {name} after 5 attempts: {output!r}"
+            )
         values = [float(value) for value in match.groups()]
         return {
             "x": values[0],
@@ -266,6 +271,9 @@ class GazeboScene:
             midpoint[0] - object_point[0], midpoint[1] - object_point[1]
         )
         midpoint_z_error = abs(midpoint[2] - object_point[2])
+        vertical_overlap = (
+            float(geometry["center_height"]) + 0.025 - midpoint_z_error
+        )
         object_diameter = 2.0 * float(geometry["half_width"])
         minimum_pad_separation = object_diameter + 0.004
         maximum_pad_separation = object_diameter + 0.018
@@ -274,7 +282,7 @@ class GazeboScene:
             and horizontal_separation <= maximum_pad_separation
             and abs(separation_vector[2]) <= 0.012
             and midpoint_xy_error <= 0.012
-            and midpoint_z_error <= 0.020
+            and vertical_overlap >= 0.005
         )
         details = {
             "validated": validated,
@@ -292,6 +300,7 @@ class GazeboScene:
             "maximum_pad_separation": maximum_pad_separation,
             "midpoint_xy_error": midpoint_xy_error,
             "midpoint_z_error": midpoint_z_error,
+            "vertical_pad_object_overlap": vertical_overlap,
         }
         if not validated:
             raise RuntimeError(
@@ -459,8 +468,21 @@ class TabletopSceneManager(Node):
             for x in (0.69, 0.78, 0.87)
             for y in (-0.27, -0.135, 0.0, 0.135, 0.27)
         ]
-        self.random.shuffle(candidates)
-        selected_positions = candidates[:count]
+        target_positions = [
+            position for position in candidates
+            if position[0] <= 0.79 and abs(position[1]) <= 0.16
+        ]
+        anchor = self.random.choice(target_positions)
+        remaining = [
+            position for position in candidates
+            if position != anchor
+            and math.hypot(
+                position[0] - anchor[0], position[1] - anchor[1]
+            ) > 0.14
+        ]
+        self.random.shuffle(remaining)
+        selected_positions = [anchor, *remaining[:count - 1]]
+        self.random.shuffle(selected_positions)
         objects = []
         for item_index, ((x_pos, y_pos), (color_name, color)) in enumerate(
             zip(selected_positions, colors), start=1
@@ -486,8 +508,13 @@ class TabletopSceneManager(Node):
                 "is_target": False,
             })
             time.sleep(0.15)
-        reachable = [item for item in objects if item["pose"]["x"] <= 0.79]
-        target = self.random.choice(reachable or objects)
+        target = min(
+            objects,
+            key=lambda item: math.hypot(
+                item["pose"]["x"] - anchor[0],
+                item["pose"]["y"] - anchor[1],
+            ),
+        )
         target["is_target"] = True
         self.current_object = dict(target)
         self.scene_objects = objects
