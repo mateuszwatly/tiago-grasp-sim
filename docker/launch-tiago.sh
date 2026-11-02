@@ -8,6 +8,14 @@ if [[ "${TIAGO_HEADLESS:-false}" == "true" ]]; then
 fi
 
 start-tabletop-scene &
+(
+  until gz topic -l 2>/dev/null | grep -qx '/external_camera/image'; do
+    sleep 1
+  done
+  ros2 run ros_gz_bridge parameter_bridge \
+    '/external_camera/camera_info@sensor_msgs/msg/CameraInfo[gz.msgs.CameraInfo' &
+  exec ros2 run ros_gz_image image_bridge /external_camera/image
+) &
 
 if [[ "${TIAGO_RUN_HEURISTIC:-false}" == "true" ]]; then
   run-grasp-heuristic &

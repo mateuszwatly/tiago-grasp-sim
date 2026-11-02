@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-import colorsys
 import json
 import math
 import random
@@ -22,6 +21,15 @@ OBJECT_GEOMETRY = {
     "cup": {"shape": "cylinder", "half_width": 0.032, "center_height": 0.0475},
     "can": {"shape": "cylinder", "half_width": 0.028, "center_height": 0.0575},
 }
+COLOR_PALETTE = (
+    ("red", (0.82, 0.10, 0.08)),
+    ("orange", (0.92, 0.34, 0.06)),
+    ("yellow", (0.88, 0.76, 0.08)),
+    ("green", (0.10, 0.68, 0.18)),
+    ("cyan", (0.08, 0.70, 0.72)),
+    ("blue", (0.08, 0.25, 0.84)),
+    ("purple", (0.52, 0.14, 0.76)),
+)
 
 
 def rgba_text(color):
@@ -65,6 +73,29 @@ def table_sdf():
       <collision name='top_collision'><pose>0.76 0 0.53 0 0 0</pose><geometry><box><size>0.66 0.92 0.04</size></box></geometry></collision>
       <visual name='top_visual'><pose>0.76 0 0.53 0 0 0</pose><geometry><box><size>0.66 0.92 0.04</size></box></geometry><material><ambient>0.42 0.28 0.15 1</ambient><diffuse>0.58 0.39 0.20 1</diffuse></material></visual>
       {''.join(legs)}
+    </link>
+  </model>
+</sdf>"""
+
+
+def external_camera_sdf():
+    return """<?xml version='1.0'?>
+<sdf version='1.9'>
+  <model name='external_rgb_camera'>
+    <static>true</static>
+    <pose>0.45 -0.85 1.35 0 0.694 1.232</pose>
+    <link name='camera_link'>
+      <sensor name='external_rgb' type='camera'>
+        <always_on>true</always_on>
+        <update_rate>10</update_rate>
+        <topic>/external_camera/image</topic>
+        <gz_frame_id>external_camera_optical_frame</gz_frame_id>
+        <camera>
+          <horizontal_fov>1.0472</horizontal_fov>
+          <image><width>1280</width><height>720</height><format>R8G8B8</format></image>
+          <clip><near>0.08</near><far>5.0</far></clip>
+        </camera>
+      </sensor>
     </link>
   </model>
 </sdf>"""
@@ -361,6 +392,8 @@ class TabletopSceneManager(Node):
         self.declare_parameter("seed", 0)
         self.declare_parameter("spawn_object_on_start", True)
         self.declare_parameter("object_type", "")
+        self.declare_parameter("clutter_min_objects", 4)
+        self.declare_parameter("clutter_max_objects", 7)
         requested_seed = int(self.get_parameter("seed").value)
         self.seed = requested_seed if requested_seed else secrets.randbits(31)
         self.random = random.Random(self.seed)
@@ -371,6 +404,7 @@ class TabletopSceneManager(Node):
             )
         self.scene = GazeboScene(self)
         self.current_object = None
+        self.scene_objects = []
         self.object_index = 0
         self.object_deck = []
         qos = QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL)
@@ -391,17 +425,17 @@ class TabletopSceneManager(Node):
 
     def initialize(self):
         self.scene.spawn("grasp_table", table_sdf())
+        self.scene.spawn("external_rgb_camera", external_camera_sdf())
         if bool(self.get_parameter("spawn_object_on_start").value):
             self.replace_object()
         self.get_logger().info(
             f"Tabletop simulation ready with scene seed {self.seed}"
         )
 
-    def random_color(self):
-        hue = self.random.random()
-        saturation = self.random.uniform(0.58, 0.90)
-        value = self.random.uniform(0.62, 0.92)
-        return tuple(float(channel) for channel in colorsys.hsv_to_rgb(hue, saturation, value))
+    def random_colors(self, count):
+        colors = list(COLOR_PALETTE)
+        self.random.shuffle(colors)
+        return [colors[index % len(colors)] for index in range(count)]
 
     def next_kind(self):
         if self.fixed_object_type:
@@ -412,30 +446,85 @@ class TabletopSceneManager(Node):
         return self.object_deck.pop()
 
     def replace_object(self):
-        if self.current_object is not None:
-            self.scene.remove(self.current_object["name"])
-        self.object_index += 1
-        kind = self.next_kind()
-        geometry = dict(OBJECT_GEOMETRY[kind])
-        color = self.random_color()
-        x_pos = 0.74 + self.random.uniform(-0.018, 0.018)
-        y_pos = self.random.uniform(-0.12, 0.12)
-        yaw = self.random.uniform(-0.22, 0.22)
-        z_pos = TABLE_HEIGHT + geometry["center_height"] + 0.003
-        name = f"scene_{self.object_index:04d}_{kind}"
-        self.scene.spawn(name, object_sdf(kind, name, color), x_pos, y_pos, z_pos, yaw)
-        self.current_object = {
+        self.remove_scene_objects()
+        minimum = int(self.get_parameter("clutter_min_objects").value)
+        maximum = int(self.get_parameter("clutter_max_objects").value)
+        if minimum < 2 or maximum < minimum:
+            raise ValueError("clutter object range must satisfy 2 <= min <= max")
+        count = self.random.randint(minimum, maximum)
+        colors = self.random_colors(count)
+        candidates = [
+            (x + self.random.uniform(-0.008, 0.008),
+             y + self.random.uniform(-0.008, 0.008))
+            for x in (0.69, 0.78, 0.87)
+            for y in (-0.27, -0.135, 0.0, 0.135, 0.27)
+        ]
+        self.random.shuffle(candidates)
+        selected_positions = candidates[:count]
+        objects = []
+        for item_index, ((x_pos, y_pos), (color_name, color)) in enumerate(
+            zip(selected_positions, colors), start=1
+        ):
+            self.object_index += 1
+            kind = self.next_kind()
+            geometry = dict(OBJECT_GEOMETRY[kind])
+            yaw = self.random.uniform(-math.pi, math.pi)
+            z_pos = TABLE_HEIGHT + geometry["center_height"] + 0.003
+            name = f"scene_{self.object_index:04d}_{kind}"
+            self.scene.spawn(
+                name, object_sdf(kind, name, color), x_pos, y_pos, z_pos, yaw
+            )
+            objects.append({
+                "instance_id": name,
+                "name": name,
+                "type": kind,
+                "color_name": color_name,
+                "color_rgb": list(color),
+                "pose": {"x": x_pos, "y": y_pos, "z": z_pos, "yaw": yaw},
+                "geometry": geometry,
+                "table_height": TABLE_HEIGHT,
+                "is_target": False,
+            })
+            time.sleep(0.15)
+        reachable = [item for item in objects if item["pose"]["x"] <= 0.79]
+        target = self.random.choice(reachable or objects)
+        target["is_target"] = True
+        self.current_object = dict(target)
+        self.scene_objects = objects
+        self.current_object.update({
             "scene_seed": self.seed,
             "scene_index": self.object_index,
-            "name": name,
-            "type": kind,
-            "color_rgb": list(color),
-            "pose": {"x": x_pos, "y": y_pos, "z": z_pos, "yaw": yaw},
-            "geometry": geometry,
-            "table_height": TABLE_HEIGHT,
-        }
+            "target_object_id": self.current_object["instance_id"],
+            "instruction": f"pick up the {self.current_object['color_name']} {self.current_object['type']}",
+            "task": {
+                "verb": "pick_up",
+                "target_instance_id": self.current_object["instance_id"],
+                "category": self.current_object["type"],
+                "color": self.current_object["color_name"],
+                "referring_expression": f"the {self.current_object['color_name']} {self.current_object['type']}",
+            },
+            "objects": objects,
+            "camera_setup": {
+                "model_inputs": ["head_rgb", "external_rgb"],
+                "head_rgb_topic": "/head_front_camera/image",
+                "external_rgb_topic": "/external_camera/image",
+                "external_camera_pose_world": {
+                    "x": 0.45, "y": -0.85, "z": 1.35,
+                    "roll": 0.0, "pitch": 0.694, "yaw": 1.232,
+                },
+            },
+        })
         self.publish_current_object()
         return self.current_object
+
+    def remove_scene_objects(self):
+        for item in self.scene_objects:
+            try:
+                self.scene.remove(item["name"])
+            except RuntimeError as error:
+                self.get_logger().warning(str(error))
+        self.scene_objects = []
+        self.current_object = None
 
     def publish_current_object(self):
         message = String()
@@ -453,9 +542,7 @@ class TabletopSceneManager(Node):
 
     def clear_scene(self, _request, response):
         try:
-            if self.current_object is not None:
-                self.scene.remove(self.current_object["name"])
-                self.current_object = None
+            self.remove_scene_objects()
             self.publish_current_object()
             response.success = True
             response.message = "Scene object cleared"
@@ -470,6 +557,10 @@ class TabletopSceneManager(Node):
                 raise RuntimeError("There is no object in the scene")
             state = dict(self.current_object)
             state["actual_pose"] = self.scene.pose(self.current_object["name"])
+            state["objects"] = [
+                {**item, "actual_pose": self.scene.pose(item["name"])}
+                for item in self.scene_objects
+            ]
             response.success = True
             response.message = json.dumps(state, sort_keys=True)
         except Exception as error:

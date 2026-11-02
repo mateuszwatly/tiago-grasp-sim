@@ -19,11 +19,13 @@ from control_msgs.action import FollowJointTrajectory
 from geometry_msgs.msg import PoseStamped
 from moveit.core.robot_state import RobotState
 from moveit.planning import MoveItPy
+from moveit_msgs.msg import CollisionObject
 from rclpy.action import ActionClient
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 from rclpy.time import Time
 from sensor_msgs.msg import JointState
+from shape_msgs.msg import SolidPrimitive
 from std_srvs.srv import Trigger
 from tf2_ros import Buffer, TransformException, TransformListener
 from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
@@ -43,6 +45,7 @@ TRACKED_FRAMES = (
     "gripper_right_finger_link",
     "arm_7_link",
 )
+ARM_JOINTS = tuple(f"arm_{index}_joint" for index in range(1, 8))
 
 
 def utc_now():
@@ -88,6 +91,25 @@ def quaternion_from_matrix(matrix):
     return {"x": qx, "y": qy, "z": qz, "w": qw}
 
 
+def quaternion_delta_rotvec(current, following):
+    ax, ay, az, aw = (current[key] for key in ("x", "y", "z", "w"))
+    bx, by, bz, bw = (following[key] for key in ("x", "y", "z", "w"))
+    # following * inverse(current)
+    x = -bw * ax + bx * aw - by * az + bz * ay
+    y = -bw * ay + bx * az + by * aw - bz * ax
+    z = -bw * az - bx * ay + by * ax + bz * aw
+    w = bw * aw + bx * ax + by * ay + bz * az
+    norm = math.sqrt(x * x + y * y + z * z + w * w)
+    x, y, z, w = (value / max(norm, 1e-12) for value in (x, y, z, w))
+    if w < 0.0:
+        x, y, z, w = -x, -y, -z, -w
+    vector_norm = math.sqrt(x * x + y * y + z * z)
+    if vector_norm <= 1e-9:
+        return [0.0, 0.0, 0.0]
+    angle = 2.0 * math.atan2(vector_norm, max(w, 1e-12))
+    return [angle * x / vector_norm, angle * y / vector_norm, angle * z / vector_norm]
+
+
 def matrix_pose(matrix):
     transform = np.asarray(matrix, dtype=float)
     return {
@@ -124,6 +146,10 @@ class ObservationRecorder(Node):
         self.active_phase = "idle"
         self.lock = threading.Lock()
         self.create_subscription(JointState, "/joint_states", self.on_joint_state, 20)
+        self.collision_publisher = self.create_publisher(
+            CollisionObject, "/collision_object", 20
+        )
+        self.published_collision_ids = set()
         self.create_timer(0.05, self.sample_end_effector)
 
     def on_joint_state(self, message):
@@ -203,6 +229,49 @@ class ObservationRecorder(Node):
     def current_end_effector_pose(self):
         transform = self.tf_buffer.lookup_transform(BASE_FRAME, EE_FRAME, Time())
         return self.transform_pose(transform)
+
+    def publish_clutter(self, scene):
+        desired_ids = {
+            item["instance_id"] for item in scene.get("objects", [])
+            if not item.get("is_target", False)
+        }
+        for object_id in self.published_collision_ids - desired_ids:
+            message = CollisionObject()
+            message.header.frame_id = BASE_FRAME
+            message.id = object_id
+            message.operation = CollisionObject.REMOVE
+            self.collision_publisher.publish(message)
+        for item in scene.get("objects", []):
+            if item.get("is_target", False):
+                continue
+            geometry = item["geometry"]
+            primitive = SolidPrimitive()
+            if geometry["shape"] == "sphere":
+                primitive.type = SolidPrimitive.SPHERE
+                primitive.dimensions = [float(geometry["half_width"])]
+            else:
+                primitive.type = SolidPrimitive.CYLINDER
+                primitive.dimensions = [
+                    2.0 * float(geometry["center_height"]),
+                    float(geometry["half_width"]),
+                ]
+            pose = PoseStamped().pose
+            pose.position.x = float(item["pose"]["x"])
+            pose.position.y = float(item["pose"]["y"])
+            pose.position.z = (
+                float(item["table_height"])
+                + float(geometry["center_height"])
+            )
+            pose.orientation.z = math.sin(float(item["pose"]["yaw"]) * 0.5)
+            pose.orientation.w = math.cos(float(item["pose"]["yaw"]) * 0.5)
+            message = CollisionObject()
+            message.header.frame_id = BASE_FRAME
+            message.id = item["instance_id"]
+            message.primitives = [primitive]
+            message.primitive_poses = [pose]
+            message.operation = CollisionObject.ADD
+            self.collision_publisher.publish(message)
+        self.published_collision_ids = desired_ids
 
 
 class ArtifactLog:
@@ -335,7 +404,7 @@ class HeuristicRecorder:
             "--output",
             str(bag_path),
             "--regex",
-            "^/(clock|joint_states|dynamic_joint_states|tf|tf_static|robot_description|rosout|diagnostics|trajectory_execution_event|display_planned_path|pipeline_state|ft_sensor_controller/(wrench|wrench_filtered)|controller_manager/(activity|introspection_data/.*|statistics/.*)|head_front_camera/(camera_info|image/compressed|depth_image/zstd|points)|arm_controller/.*|gripper_controller/.*|torso_controller/.*)$",
+            "^/(clock|joint_states|dynamic_joint_states|tf|tf_static|robot_description|rosout|diagnostics|trajectory_execution_event|display_planned_path|pipeline_state|tiago_grasp_sim/object|external_camera/(image|camera_info)|ft_sensor_controller/(wrench|wrench_filtered)|controller_manager/(activity|introspection_data/.*|statistics/.*)|head_front_camera/(camera_info|image/compressed|depth_image/zstd|points)|arm_controller/.*|gripper_controller/.*|torso_controller/.*)$",
         ]
         self.bag_process = subprocess.Popen(
             command,
@@ -374,7 +443,10 @@ class HeuristicRecorder:
 
     def request_random_object(self):
         payload = self.call_scene_service(self.reset_scene_client, "reset_scene")
-        return json.loads(payload)
+        scene = json.loads(payload)
+        self.node.publish_clutter(scene)
+        time.sleep(1.0)
+        return scene
 
     def clear_scene_object(self):
         self.call_scene_service(self.clear_scene_client, "clear_scene")
@@ -710,6 +782,80 @@ class HeuristicRecorder:
         reset["execution_status"] = "SUCCESSFUL"
         return reset
 
+    def write_training_steps(self, episode, path):
+        samples = episode.get("actual_ee_path", [])
+        task = episode["object"].get("task", {})
+        distractors = [
+            item["instance_id"]
+            for item in episode["object"].get("objects", [])
+            if not item.get("is_target", False)
+        ]
+        with path.open("w", encoding="utf-8") as stream:
+            for index, sample in enumerate(samples):
+                following = samples[min(index + 1, len(samples) - 1)]
+                current_pose = sample["ee_pose"]
+                next_pose = following["ee_pose"]
+                delta_position = [
+                    next_pose["position"][axis] - current_pose["position"][axis]
+                    for axis in ("x", "y", "z")
+                ]
+                delta_rotation = quaternion_delta_rotvec(
+                    current_pose["orientation"], next_pose["orientation"]
+                )
+                joints = sample.get("joint_state") or {
+                    "name": [], "position": [], "velocity": [], "effort": []
+                }
+                positions = dict(zip(joints["name"], joints["position"]))
+                velocities = dict(zip(joints["name"], joints["velocity"]))
+                efforts = dict(zip(joints["name"], joints["effort"]))
+                next_joints = following.get("joint_state") or joints
+                next_positions = dict(
+                    zip(next_joints["name"], next_joints["position"])
+                )
+                arm_names = list(ARM_JOINTS)
+                finger_names = [
+                    "gripper_left_finger_joint", "gripper_right_finger_joint"
+                ]
+                gripper = sum(float(positions.get(name, 0.0)) for name in finger_names) / 2.0
+                next_gripper = sum(
+                    float(next_positions.get(name, gripper)) for name in finger_names
+                ) / 2.0
+                record = {
+                    "step_index": index,
+                    "sim_time": sample["sim_time"],
+                    "phase": sample["phase"],
+                    "task": task,
+                    "observation": {
+                        "rgb": {
+                            "head": {"topic": "/head_front_camera/image/compressed", "nearest_timestamp": sample["sim_time"]},
+                            "external": {"topic": "/external_camera/image", "nearest_timestamp": sample["sim_time"]},
+                        },
+                        "end_effector_pose_base": current_pose,
+                        "arm_joint_position": [float(positions.get(name, 0.0)) for name in arm_names],
+                        "arm_joint_velocity": [float(velocities.get(name, 0.0)) for name in arm_names],
+                        "arm_joint_effort": [float(efforts.get(name, 0.0)) for name in arm_names],
+                        "arm_joint_names": arm_names,
+                        "gripper_position": gripper,
+                    },
+                    "action": {
+                        "representation": "delta_end_effector_rotvec_gripper_terminate",
+                        "values": delta_position + delta_rotation + [next_gripper, float(index == len(samples) - 1)],
+                    },
+                    "supervision": {
+                        "target_instance_id": task.get("target_instance_id"),
+                        "distractor_instance_ids": distractors,
+                        "success": bool(episode.get("grasp_success")),
+                    },
+                }
+                stream.write(json.dumps(record, sort_keys=True) + "\n")
+        return {
+            "path": path.name,
+            "step_count": len(samples),
+            "primary_action_dimension": 8,
+            "primary_action": "delta xyz + delta rotation-vector + gripper + terminate",
+            "full_arm_state_retained": True,
+        }
+
     def generate_episode(self, index, object_info):
         policy_result = self.policy.compute(object_info)
         pregrasp = policy_result["pregrasp_pose"]
@@ -734,6 +880,14 @@ class HeuristicRecorder:
             "grasp_success": False,
             "grasp_label": "failed",
             "physical_contact_verified": False,
+            "obstacle_avoidance": {
+                "planner": "MoveIt OMPL RRTConnect with distractor collision objects",
+                "distractor_instance_ids": [
+                    item["instance_id"] for item in object_info.get("objects", [])
+                    if not item.get("is_target", False)
+                ],
+                "whole_arm_collision_checked": True,
+            },
             "planned_segments": [],
             "reset_segments": [],
             "actual_ee_path": [],
@@ -930,6 +1084,12 @@ class HeuristicRecorder:
                     f"Could not return arm to its ready pose: {error}",
                     episode=index,
                 )
+            steps_path = self.session_dir / (
+                f"episode_{index:03d}_{object_info['type']}_steps.jsonl"
+            )
+            episode["training_steps"] = self.write_training_steps(
+                episode, steps_path
+            )
             path.write_text(
                 json.dumps(episode, indent=2, sort_keys=True), encoding="utf-8"
             )
@@ -958,6 +1118,43 @@ class HeuristicRecorder:
             "grasp_labels": "verified_by_gazebo_object_lift",
             "objects": [],
         }
+        dataset_schema = {
+            "schema_version": 1,
+            "task_input": {
+                "verb": "pick_up",
+                "target": "category + color referring expression",
+                "simulator_instance_id_is_supervision_only": True,
+            },
+            "observations": {
+                "rgb_topics": [
+                    "/head_front_camera/image/compressed",
+                    "/external_camera/image",
+                ],
+                "camera_calibration_topics": [
+                    "/head_front_camera/camera_info",
+                    "/external_camera/camera_info",
+                ],
+                "proprioception": [
+                    "7 arm joint positions, velocities, efforts",
+                    "absolute end-effector pose in base_footprint",
+                    "two-finger gripper position",
+                ],
+            },
+            "primary_action": {
+                "dimension": 8,
+                "layout": ["dx", "dy", "dz", "drot_x", "drot_y", "drot_z", "gripper", "terminate"],
+                "rotation": "axis-angle rotation vector",
+                "frame": BASE_FRAME,
+            },
+            "native_actions_retained": "full planned joint trajectories and measured joint states",
+            "storage": {
+                "sensors": "MCAP with zstd compression",
+                "aligned_policy_steps": "JSON Lines keyed by simulation timestamp",
+            },
+        }
+        (self.session_dir / "dataset_schema.json").write_text(
+            json.dumps(dataset_schema, indent=2, sort_keys=True), encoding="utf-8"
+        )
         (self.session_dir / "manifest.json").write_text(
             json.dumps(manifest, indent=2, sort_keys=True), encoding="utf-8"
         )

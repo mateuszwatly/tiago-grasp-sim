@@ -16,7 +16,7 @@ mkdir -p datasets recordings
 
 Gazebo opens on the host display. Set `TIAGO_HEADLESS=true` only when a GUI is not needed.
 
-By default, the scene contains the table and exactly one randomized apple, cup, or can. Bowls are excluded because their low profile requires a separate top-grasp strategy. The robot does not move because `TIAGO_RUN_HEURISTIC=false`.
+By default, the scene contains the table and 4–7 randomized apples, cups, and cans. Each instance has a distinct color and randomized pose. One reachable object is selected as the target and published with a visual referring expression such as `pick up the blue can`. Bowls are excluded because their low profile requires a separate top-grasp strategy. The robot does not move because `TIAGO_RUN_HEURISTIC=false`.
 
 ## Policy-independent scene interface
 
@@ -28,7 +28,7 @@ The scene manager publishes the current object as JSON on a transient-local topi
   --qos-durability transient_local --qos-reliability reliable
 ```
 
-The JSON contains the scene seed, object type, RGB color, world pose, table height, and physical geometry such as `half_width` and `center_height`. It contains no grasp target or policy output.
+The JSON contains the target task, every scene instance, RGB colors, world poses, table height, and physical geometry such as `half_width` and `center_height`. The task-facing fields are `verb`, `category`, `color`, and `referring_expression`. Instance IDs and world poses are simulator supervision and should not be supplied as model inputs.
 
 Replace the current object with another randomized object:
 
@@ -77,11 +77,31 @@ The optional policy adapts the PCA, cutting-plane, and antipodal contact ranking
 ./scripts/compose.sh exec tiago run-grasp-heuristic
 ```
 
-Or set `TIAGO_RUN_HEURISTIC=true` before startup. `HEURISTIC_EPISODES` defaults to one. Each episode starts from a randomized viable arm pose, moves to a 10 cm pregrasp, approaches the ranked contacts, fully closes both fingers, and lifts 5 cm. It records the planned segments and the measured end-effector path under `datasets/`.
+Or set `TIAGO_RUN_HEURISTIC=true` before startup. `HEURISTIC_EPISODES` defaults to one. Each episode starts from a randomized viable arm pose, moves to a 10 cm pregrasp, approaches the ranked contacts, closes both fingers around the selected target, and lifts 5 cm. Distractors are inserted into MoveIt's planning scene, so OMPL checks the full TIAGo arm and gripper against clutter while planning. It records the planned segments and measured end-effector path under `datasets/`.
 
 The contact pose accounts for the PAL gripper's URDF geometry: its finger-pad center is 45 mm forward of `gripper_grasping_frame`, and the policy keeps the full pad collision box above the table. The position controller closes only to the sampled object surfaces, including the 5 mm pad half-thickness. Before simulated grasp stabilization, the scene manager independently reads the actual Gazebo poses of the object and both finger links and requires the object to be enclosed between the pads. A miss is rejected without attaching or lifting the object. The episode records the measurements in `grasp_stabilization.pre_attachment_enclosure`.
 
 An attempt is labeled `success` only when the end effector reaches its lift target and Gazebo reports that the object rose by at least half the commanded lift (with a 2 cm minimum). A miss remains in the dataset as `failed`; controller completion alone cannot produce a successful label.
+
+## Two-camera learning dataset
+
+The recorder saves synchronized observations in compressed MCAP:
+
+- TIAGo head RGB at `/head_front_camera/image/compressed`.
+- A fixed external 1280×720 RGB view at `/external_camera/image`.
+- Both camera-info streams, TF, complete joint state, force/torque, controller feedback, plans, and task metadata.
+
+Each episode also has an `episode_*_steps.jsonl` file aligned by simulation timestamp. The portable action is an 8D vector:
+
+```text
+[dx, dy, dz, drot_x, drot_y, drot_z, gripper_position, terminate]
+```
+
+Rotation is a relative axis-angle vector and translation is relative to `base_footprint`. Each step retains the absolute end-effector pose plus all seven arm joint positions, velocities, and efforts. `dataset_schema.json` describes these fields.
+
+Use both representations when training. End-effector deltas are the primary policy output because they transfer across robot arms and match the canonical action used by [Open X-Embodiment](https://github.com/google-deepmind/open_x_embodiment). Keep full joint state as proprioceptive input and auxiliary supervision: two end-effector-equivalent poses can have different elbow configurations, and only the full configuration explains whether the arm clears surrounding objects. At deployment, send the predicted end-effector action through MoveIt/IK and a whole-arm collision checker instead of predicting seven TIAGo-specific joint commands directly.
+
+The scene and label design follows the useful parts of [Sim-MEES](https://arxiv.org/abs/2305.10580): multi-object physics, instance labels, calibrated views, collision-aware grasp candidates, and dynamic lift validation. The two-view RGB and task-conditioning layout is also compatible with collection patterns used by [BridgeData V2](https://arxiv.org/abs/2308.12952) and [DROID](https://droid-dataset.github.io/).
 
 ## Configuration
 
@@ -92,6 +112,8 @@ An attempt is labeled `success` only when the end effector reaches its lift targ
 | `SCENE_SEED` | `0` | Scene manager; zero selects and publishes a random seed. |
 | `SCENE_SPAWN_OBJECT` | `true` | Scene manager; spawn one object at startup. |
 | `SCENE_OBJECT_TYPE` | empty | Fix every scene to `apple`, `cup`, or `can`; empty selects among them. |
+| `SCENE_CLUTTER_MIN_OBJECTS` | `4` | Minimum objects in a cluttered scene. |
+| `SCENE_CLUTTER_MAX_OBJECTS` | `7` | Maximum objects in a cluttered scene. |
 | `TIAGO_RUN_HEURISTIC` | `false` | Start the optional reference policy automatically. |
 | `HEURISTIC_SEED` | `0` | Reference policy random-start seed. |
 | `HEURISTIC_EPISODES` | `1` | Reference policy recording count. |
