@@ -1,0 +1,6 @@
+.git
+.env
+.docker.xauth
+recordings
+datasets
+README.md

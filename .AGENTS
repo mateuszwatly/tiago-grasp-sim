@@ -1,0 +1,4 @@
+# Repository instructions
+
+- Do not add, generate, or introduce tests in this repository.
+- Do not add smoke-test scripts or test-only validation code.

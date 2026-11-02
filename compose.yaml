@@ -1,0 +1,41 @@
+services:
+  tiago:
+    image: tiago-grasp:jazzy-harmonic
+    build:
+      context: .
+      args:
+        USER_ID: ${USER_ID:-1000}
+        GROUP_ID: ${GROUP_ID:-1000}
+    container_name: tiago-grasp
+    network_mode: host
+    ipc: host
+    init: true
+    devices:
+      - /dev/dri:/dev/dri
+    group_add:
+      - "44"
+      - "992"
+    environment:
+      DISPLAY: ${DISPLAY:-:0}
+      XAUTHORITY: /tmp/.docker.xauth
+      QT_X11_NO_MITSHM: "1"
+      ROS_DOMAIN_ID: ${ROS_DOMAIN_ID:-42}
+      TIAGO_WORLD: ${TIAGO_WORLD:-empty}
+      TIAGO_HEADLESS: ${TIAGO_HEADLESS:-false}
+      TIAGO_RUN_HEURISTIC: ${TIAGO_RUN_HEURISTIC:-false}
+      SCENE_SEED: ${SCENE_SEED:-0}
+      SCENE_SPAWN_OBJECT: ${SCENE_SPAWN_OBJECT:-true}
+      SCENE_OBJECT_TYPE: ${SCENE_OBJECT_TYPE:-}
+      HEURISTIC_SEED: ${HEURISTIC_SEED:-0}
+      HEURISTIC_EPISODES: ${HEURISTIC_EPISODES:-1}
+      HEURISTIC_FINGER_PAD_Z_CORRECTION: ${HEURISTIC_FINGER_PAD_Z_CORRECTION:-0.0}
+      HEURISTIC_LIFT_DISTANCE: ${HEURISTIC_LIFT_DISTANCE:-0.05}
+      HEURISTIC_SPEED_SCALE: ${HEURISTIC_SPEED_SCALE:-2.5}
+    volumes:
+      - /tmp/.X11-unix:/tmp/.X11-unix:rw
+      - ./.docker.xauth:/tmp/.docker.xauth:ro
+      - ./recordings:/data/rosbags
+      - ./datasets:/data/grasp_dataset
+    stdin_open: true
+    tty: true
+    stop_grace_period: 30s
