@@ -7,3 +7,5 @@ recordings/*
 !recordings/.gitkeep
 datasets/*
 !datasets/.gitkeep
+ready_datasets/*
+!ready_datasets/.gitkeep

@@ -30,14 +30,17 @@ services:
       SCENE_CLUTTER_MAX_OBJECTS: ${SCENE_CLUTTER_MAX_OBJECTS:-7}
       HEURISTIC_SEED: ${HEURISTIC_SEED:-0}
       HEURISTIC_EPISODES: ${HEURISTIC_EPISODES:-1}
+      HEURISTIC_OUTPUT_DIR: ${HEURISTIC_OUTPUT_DIR:-/data/grasp_dataset}
+      HEURISTIC_RECORD_DIAGNOSTICS: ${HEURISTIC_RECORD_DIAGNOSTICS:-true}
       HEURISTIC_FINGER_PAD_Z_CORRECTION: ${HEURISTIC_FINGER_PAD_Z_CORRECTION:-0.0}
       HEURISTIC_LIFT_DISTANCE: ${HEURISTIC_LIFT_DISTANCE:-0.05}
-      HEURISTIC_SPEED_SCALE: ${HEURISTIC_SPEED_SCALE:-2.5}
+      HEURISTIC_SPEED_SCALE: ${HEURISTIC_SPEED_SCALE:-4.0}
     volumes:
       - /tmp/.X11-unix:/tmp/.X11-unix:rw
       - ./.docker.xauth:/tmp/.docker.xauth:ro
       - ./recordings:/data/rosbags
       - ./datasets:/data/grasp_dataset
+      - ./ready_datasets:/data/ready_datasets
     stdin_open: true
     tty: true
     stop_grace_period: 30s

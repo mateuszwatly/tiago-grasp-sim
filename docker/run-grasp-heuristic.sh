@@ -17,18 +17,19 @@ for _ in $(seq 1 120); do
     # Let the upstream tuck motion finish before this process starts sending
     # goals to the same arm controller.
     sleep 30
-    ros2 param set /arm_controller constraints.goal_time 5.0 >/dev/null
+    ros2 param set /arm_controller constraints.goal_time 15.0 >/dev/null
     exec ros2 launch tiago_grasp_dataset run_heuristic.launch.py \
       use_sim_time:=True \
       base_type:=pmb2 \
       arm_type:=tiago-arm \
       end_effector:=pal-gripper \
-      output_dir:=/data/grasp_dataset \
+      output_dir:="${HEURISTIC_OUTPUT_DIR:-/data/grasp_dataset}" \
       seed:="${HEURISTIC_SEED:-0}" \
       example_count:="${HEURISTIC_EPISODES:-1}" \
       finger_pad_z_correction:="${HEURISTIC_FINGER_PAD_Z_CORRECTION:-0.0}" \
       lift_distance:="${HEURISTIC_LIFT_DISTANCE:-0.05}" \
-      speed_scale:="${HEURISTIC_SPEED_SCALE:-2.5}"
+      speed_scale:="${HEURISTIC_SPEED_SCALE:-4.0}" \
+      record_diagnostics:="${HEURISTIC_RECORD_DIAGNOSTICS:-true}"
   fi
   sleep 2
 done

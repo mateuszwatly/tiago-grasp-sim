@@ -302,6 +302,12 @@ class HeuristicRecorder:
         )
         self.lift_distance = float(node.get_parameter("lift_distance").value)
         self.speed_scale = float(node.get_parameter("speed_scale").value)
+        diagnostics_value = node.get_parameter("record_diagnostics").value
+        self.record_diagnostics = (
+            diagnostics_value
+            if isinstance(diagnostics_value, bool)
+            else str(diagnostics_value).lower() in ("1", "true", "yes", "on")
+        )
         if self.example_count < 1:
             raise ValueError("example_count must be at least 1")
         if self.speed_scale <= 0.0:
@@ -400,11 +406,13 @@ class HeuristicRecorder:
             "mcap",
             "--storage-preset-profile",
             "zstd_fast",
+            "--max-bag-size",
+            str(4 * 1024 * 1024 * 1024),
             "--include-hidden-topics",
             "--output",
             str(bag_path),
             "--regex",
-            "^/(clock|joint_states|dynamic_joint_states|tf|tf_static|robot_description|rosout|diagnostics|trajectory_execution_event|display_planned_path|pipeline_state|tiago_grasp_sim/object|external_camera/(image|camera_info)|ft_sensor_controller/(wrench|wrench_filtered)|controller_manager/(activity|introspection_data/.*|statistics/.*)|head_front_camera/(camera_info|image/compressed|depth_image/zstd|points)|arm_controller/.*|gripper_controller/.*|torso_controller/.*)$",
+            "^/(clock|joint_states|tf|tf_static|tiago_grasp_sim/object|external_camera/(image/compressed|camera_info)|ft_sensor_controller/(wrench|wrench_filtered)|head_front_camera/(camera_info|image/compressed)|arm_controller/.*|gripper_controller/.*|torso_controller/.*)$",
         ]
         self.bag_process = subprocess.Popen(
             command,
@@ -828,7 +836,7 @@ class HeuristicRecorder:
                     "observation": {
                         "rgb": {
                             "head": {"topic": "/head_front_camera/image/compressed", "nearest_timestamp": sample["sim_time"]},
-                            "external": {"topic": "/external_camera/image", "nearest_timestamp": sample["sim_time"]},
+                            "external": {"topic": "/external_camera/image/compressed", "nearest_timestamp": sample["sim_time"]},
                         },
                         "end_effector_pose_base": current_pose,
                         "arm_joint_position": [float(positions.get(name, 0.0)) for name in arm_names],
@@ -1112,6 +1120,7 @@ class HeuristicRecorder:
                 "pregrasp_distance": self.policy.pregrasp_distance,
                 "lift_distance": self.lift_distance,
                 "arm_trajectory_speed_scale": self.speed_scale,
+                "raw_gazebo_diagnostics_recorded": self.record_diagnostics,
             },
             "base_motion_commanded": False,
             "lift_commanded": True,
@@ -1128,7 +1137,7 @@ class HeuristicRecorder:
             "observations": {
                 "rgb_topics": [
                     "/head_front_camera/image/compressed",
-                    "/external_camera/image",
+                    "/external_camera/image/compressed",
                 ],
                 "camera_calibration_topics": [
                     "/head_front_camera/camera_info",
@@ -1166,7 +1175,8 @@ class HeuristicRecorder:
         )
         episodes = []
         try:
-            self.start_gazebo_diagnostics()
+            if self.record_diagnostics:
+                self.start_gazebo_diagnostics()
             self.start_bag()
             for index in range(1, self.example_count + 1):
                 object_info = self.request_random_object()
@@ -1185,7 +1195,8 @@ class HeuristicRecorder:
                     f"Could not clear the scene object: {error}",
                 )
             self.stop_bag()
-            self.stop_gazebo_diagnostics()
+            if self.record_diagnostics:
+                self.stop_gazebo_diagnostics()
         summary = self.write_summary(episodes, final=True)
         self.log.write("session_completed", "Heuristic recording session completed", **summary)
         return summary
@@ -1217,6 +1228,26 @@ class HeuristicRecorder:
         }
         (self.session_dir / "summary.json").write_text(
             json.dumps(summary, indent=2, sort_keys=True), encoding="utf-8"
+        )
+        index_records = []
+        for episode in episodes:
+            episode_index = int(episode["episode_index"])
+            split_bucket = episode_index % 10
+            split = "test" if split_bucket == 0 else "validation" if split_bucket == 1 else "train"
+            object_type = episode["object"]["type"]
+            index_records.append({
+                "episode_index": episode_index,
+                "split": split,
+                "status": episode["status"],
+                "success": bool(episode.get("grasp_success")),
+                "instruction": episode["object"].get("instruction"),
+                "object_type": object_type,
+                "episode_path": f"episode_{episode_index:03d}_{object_type}.json",
+                "steps_path": f"episode_{episode_index:03d}_{object_type}_steps.jsonl",
+            })
+        (self.session_dir / "dataset_index.jsonl").write_text(
+            "".join(json.dumps(record, sort_keys=True) + "\n" for record in index_records),
+            encoding="utf-8",
         )
         return summary
 

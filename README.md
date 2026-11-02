@@ -88,7 +88,7 @@ An attempt is labeled `success` only when the end effector reaches its lift targ
 The recorder saves synchronized observations in compressed MCAP:
 
 - TIAGo head RGB at `/head_front_camera/image/compressed`.
-- A fixed external 1280×720 RGB view at `/external_camera/image`.
+- A fixed external 1280×720 RGB view recorded from `/external_camera/image/compressed`.
 - Both camera-info streams, TF, complete joint state, force/torque, controller feedback, plans, and task metadata.
 
 Each episode also has an `episode_*_steps.jsonl` file aligned by simulation timestamp. The portable action is an 8D vector:
@@ -98,6 +98,20 @@ Each episode also has an `episode_*_steps.jsonl` file aligned by simulation time
 ```
 
 Rotation is a relative axis-angle vector and translation is relative to `base_footprint`. Each step retains the absolute end-effector pose plus all seven arm joint positions, velocities, and efforts. `dataset_schema.json` describes these fields.
+
+For a model-ready 300-attempt collection, use a separate mounted directory and disable the very large raw Gazebo diagnostic streams:
+
+```bash
+mkdir -p ready_datasets/clutter_pick_300
+TIAGO_RUN_HEURISTIC=true \
+HEURISTIC_EPISODES=300 \
+HEURISTIC_OUTPUT_DIR=/data/ready_datasets/clutter_pick_300 \
+HEURISTIC_RECORD_DIAGNOSTICS=false \
+HEURISTIC_SPEED_SCALE=4.0 \
+./scripts/compose.sh up -d --build
+```
+
+The MCAP files split at 4 GiB. `dataset_index.jsonl` provides deterministic train, validation, and test assignments and identifies successful and failed episodes. Train the behavior-cloning policy on verified successes; retain failures for failure prediction, quality filtering, or offline reinforcement learning.
 
 Use both representations when training. End-effector deltas are the primary policy output because they transfer across robot arms and match the canonical action used by [Open X-Embodiment](https://github.com/google-deepmind/open_x_embodiment). Keep full joint state as proprioceptive input and auxiliary supervision: two end-effector-equivalent poses can have different elbow configurations, and only the full configuration explains whether the arm clears surrounding objects. At deployment, send the predicted end-effector action through MoveIt/IK and a whole-arm collision checker instead of predicting seven TIAGo-specific joint commands directly.
 
@@ -117,9 +131,11 @@ The scene and label design follows the useful parts of [Sim-MEES](https://arxiv.
 | `TIAGO_RUN_HEURISTIC` | `false` | Start the optional reference policy automatically. |
 | `HEURISTIC_SEED` | `0` | Reference policy random-start seed. |
 | `HEURISTIC_EPISODES` | `1` | Reference policy recording count. |
+| `HEURISTIC_OUTPUT_DIR` | `/data/grasp_dataset` | Container directory for generated sessions. |
+| `HEURISTIC_RECORD_DIAGNOSTICS` | `true` | Record verbose Gazebo pose/contact diagnostics; disable for large training collections. |
 | `HEURISTIC_FINGER_PAD_Z_CORRECTION` | `0.0` | Optional vertical correction from the object's settled center to the gripper pad center, in metres. |
 | `HEURISTIC_LIFT_DISTANCE` | `0.05` | Post-close lift distance in metres. |
-| `HEURISTIC_SPEED_SCALE` | `2.5` | Reference policy trajectory-duration scale. |
+| `HEURISTIC_SPEED_SCALE` | `4.0` | Reference policy trajectory-duration scale; larger values execute more slowly. |
 | `ROS_DOMAIN_ID` | `42` | ROS graph isolation. |
 
 Stop the stack with Ctrl+C in the startup terminal or run `./scripts/compose.sh down`.

@@ -38,7 +38,10 @@ def generate_launch_description():
         DeclareLaunchArgument("finger_pad_z_correction", default_value="0.0")
     )
     description.add_action(DeclareLaunchArgument("lift_distance", default_value="0.05"))
-    description.add_action(DeclareLaunchArgument("speed_scale", default_value="2.5"))
+    description.add_action(DeclareLaunchArgument("speed_scale", default_value="4.0"))
+    description.add_action(
+        DeclareLaunchArgument("record_diagnostics", default_value="true")
+    )
     description.add_action(OpaqueFunction(function=start_heuristic))
     return description
 
@@ -107,6 +110,9 @@ def start_heuristic(context, *args, **kwargs):
                     ),
                     "lift_distance": LaunchConfiguration("lift_distance"),
                     "speed_scale": LaunchConfiguration("speed_scale"),
+                    "record_diagnostics": LaunchConfiguration(
+                        "record_diagnostics"
+                    ),
                 },
             ],
         )
