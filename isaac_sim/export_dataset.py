@@ -18,8 +18,11 @@ def export(source, output, successes_only=False, keep_replays=False):
     if (output / 'dataset.json').exists():
         raise ValueError('Use a new output directory; exports are immutable snapshots')
     rows, rejected, seen = [], [], set()
+    cached_session, camera_files = None, {}
     for metadata_path in sorted(source.glob('*/episodes/*/metadata.json'), reverse=True):
         session = metadata_path.parents[2]
+        if session != cached_session:
+            cached_session, camera_files = session, {}
         validation = session / 'validation.json'
         if validation.exists() and not read_json(validation).get('valid_for_training', True):
             continue
@@ -55,8 +58,14 @@ def export(source, output, successes_only=False, keep_replays=False):
             for t in trajectory:
                 frame = {'time_seconds': float(times[len(frames)]), 'frame_id': t['replicator_frame'], 'phase': t['phase'], 'cameras': {}}
                 for camera, directory in t['camera_paths'].items():
-                    files = sorted((session / directory).glob(f'*_{t["replicator_frame"]:04d}.*'))
-                    by_kind = {f.stem.rsplit('_', 1)[0]: f for f in files}
+                    if directory not in camera_files:
+                        indexed = {}
+                        for f in (session / directory).iterdir():
+                            parts = f.stem.rsplit('_', 1)
+                            if len(parts) == 2 and parts[1].isdigit():
+                                indexed.setdefault(int(parts[1]), {})[parts[0]] = f
+                        camera_files[directory] = indexed
+                    by_kind = camera_files[directory].get(t['replicator_frame'], {})
                     for required in ['rgb', 'distance_to_image_plane', 'camera_params', 'semantic_segmentation', 'instance_id_segmentation']:
                         if required not in by_kind:
                             raise ValueError(f'missing {camera}/{required} frame {t["replicator_frame"]}')
@@ -119,7 +128,7 @@ def export(source, output, successes_only=False, keep_replays=False):
     (output / 'episodes.jsonl').write_text(''.join(json.dumps(r) + '\n' for r in rows))
     (output / 'rejected.jsonl').write_text(''.join(json.dumps(r) + '\n' for r in rejected))
     summary = {'schema_version': 1, 'episode_count': len(rows), 'successes': sum(r['success'] for r in rows),
-               'rejected': len(rejected), 'keep_replays': keep_replays, 'split_policy': 'sha256(scene_seed) modulo 100: 80/10/10; replay deduplicated',
+               'rejected': len(rejected), 'keep_replays': keep_replays, 'split_policy': 'sha256(scene_seed) modulo 100: 80/10/10; replays grouped',
                'media_storage': 'relative references; retain source recordings',
                'action_semantics': 'achieved_motion is observed next-frame world delta xyz, world rotvec, next left-finger position; not a command',
                'units': 'meters, radians, seconds; poses world frame; quaternions explicitly ordered',
