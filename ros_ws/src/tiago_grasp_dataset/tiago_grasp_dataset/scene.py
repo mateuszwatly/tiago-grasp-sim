@@ -559,7 +559,7 @@ class TabletopSceneManager(Node):
                 "table_height": TABLE_HEIGHT,
                 "is_target": False,
             })
-            time.sleep(0.15)
+            time.sleep(0.02)
         target = min(
             objects,
             key=lambda item: math.hypot(

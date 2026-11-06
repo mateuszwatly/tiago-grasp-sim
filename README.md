@@ -107,7 +107,7 @@ TIAGO_RUN_HEURISTIC=true \
 HEURISTIC_EPISODES=300 \
 HEURISTIC_OUTPUT_DIR=/data/ready_datasets/clutter_pick_300 \
 HEURISTIC_RECORD_DIAGNOSTICS=false \
-HEURISTIC_SPEED_SCALE=4.0 \
+HEURISTIC_SPEED_SCALE=1.0 \
 ./scripts/compose.sh up -d --build
 ```
 
@@ -135,7 +135,7 @@ The scene and label design follows the useful parts of [Sim-MEES](https://arxiv.
 | `HEURISTIC_RECORD_DIAGNOSTICS` | `true` | Record verbose Gazebo pose/contact diagnostics; disable for large training collections. |
 | `HEURISTIC_FINGER_PAD_Z_CORRECTION` | `0.0` | Optional vertical correction from the object's settled center to the gripper pad center, in metres. |
 | `HEURISTIC_LIFT_DISTANCE` | `0.05` | Post-close lift distance in metres. |
-| `HEURISTIC_SPEED_SCALE` | `4.0` | Reference policy trajectory-duration scale; larger values execute more slowly. |
+| `HEURISTIC_SPEED_SCALE` | `1.0` | Reference policy trajectory-duration scale; larger values execute more slowly. Keep `1.0` for MoveIt's time-optimal timing. |
 | `ROS_DOMAIN_ID` | `42` | ROS graph isolation. |
 
 Stop the stack with Ctrl+C in the startup terminal or run `./scripts/compose.sh down`.

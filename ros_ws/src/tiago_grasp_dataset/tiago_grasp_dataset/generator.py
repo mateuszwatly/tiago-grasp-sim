@@ -453,7 +453,9 @@ class HeuristicRecorder:
         payload = self.call_scene_service(self.reset_scene_client, "reset_scene")
         scene = json.loads(payload)
         self.node.publish_clutter(scene)
-        time.sleep(1.0)
+        # The dataset world targets up to 5x real time. A short wall delay is
+        # enough for spawned objects and camera streams to settle.
+        time.sleep(0.25)
         return scene
 
     def clear_scene_object(self):
@@ -591,7 +593,7 @@ class HeuristicRecorder:
                 segment["execution_status"] = "MEASURED_TARGET_REACHED"
                 segment["execution_attempts"] = attempts
                 return segment
-            time.sleep(0.5)
+            time.sleep(0.1)
         errors = [
             item.get("position_error") for item in attempts
             if item.get("position_error") is not None
@@ -633,7 +635,7 @@ class HeuristicRecorder:
         except RuntimeError as error:
             segment["execution_status"] = "FAILED"
             segment["controller_error"] = str(error)
-        time.sleep(0.5)
+        time.sleep(0.1)
         return segment
 
     def execute_segment(self, client, segment):
@@ -691,7 +693,7 @@ class HeuristicRecorder:
         succeeded = result.error_code == FollowJointTrajectory.Result.SUCCESSFUL
         if not succeeded and not allow_contact:
             raise RuntimeError(f"Gripper failed phase {phase}: {result.error_string}")
-        time.sleep(0.5)
+        time.sleep(0.1)
         return {
             "phase": phase,
             "controller": "gripper_controller",
@@ -958,7 +960,7 @@ class HeuristicRecorder:
                     allow_contact=True,
                 )
             )
-            time.sleep(0.75)
+            time.sleep(0.2)
             self.record_phase_snapshot(episode, "fingers_closed")
             episode["contact_pose_validation"] = self.validate_motion(
                 (
@@ -1000,7 +1002,7 @@ class HeuristicRecorder:
             )
             self.record_phase_snapshot(episode, "lift_pose_reached")
             self.node.set_phase("hold_after_lift")
-            time.sleep(1.0)
+            time.sleep(0.25)
             episode["actual_ee_path"] = self.node.finish_path()
             episode["lift_motion_validation"] = self.validate_motion(
                 (

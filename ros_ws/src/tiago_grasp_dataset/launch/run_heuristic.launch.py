@@ -38,7 +38,7 @@ def generate_launch_description():
         DeclareLaunchArgument("finger_pad_z_correction", default_value="0.0")
     )
     description.add_action(DeclareLaunchArgument("lift_distance", default_value="0.05"))
-    description.add_action(DeclareLaunchArgument("speed_scale", default_value="4.0"))
+    description.add_action(DeclareLaunchArgument("speed_scale", default_value="1.0"))
     description.add_action(
         DeclareLaunchArgument("record_diagnostics", default_value="true")
     )
