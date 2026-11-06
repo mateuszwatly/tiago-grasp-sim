@@ -11,7 +11,7 @@ mkdir -p \
   "${ISAAC_OUTPUT_ROOT:-/workspace/ready_datasets/isaac_clutter_pick}" \
   /workspace/.isaac_cache/{main,computecache,kit,logs,config,data}
 
-tiago_usd=/workspace/isaac_sim/assets/generated/tiago/tiago.usd
+tiago_usd=/workspace/isaac_sim/assets/generated/tiago_direct/tiago.usd
 tiago_urdf=/workspace/isaac_sim/assets/tiago_source/tiago.urdf
 if [[ ! -f "${tiago_urdf}" ]]; then
   echo "TIAGo source asset is missing; run ./scripts/isaac.sh export-tiago first." >&2

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 from pathlib import Path
 
 from isaacsim import SimulationApp
@@ -30,8 +31,8 @@ def main() -> None:
             urdf_path=str(args.urdf.resolve()),
             usd_path=str(args.output.parent.resolve()),
             fix_base=True,
-            merge_fixed_joints=False,
-            merge_mesh=False,
+            merge_fixed_joints=True,
+            merge_mesh=True,
             collision_from_visuals=False,
             collision_type="Convex Hull",
             allow_self_collision=False,
@@ -43,10 +44,10 @@ def main() -> None:
         )
         imported_path = Path(URDFImporter(config).import_urdf())
         if imported_path.resolve() != args.output.resolve():
-            args.output.write_text(
-                f"#usda 1.0\n(\n    subLayers = [@{imported_path.as_posix()}@]\n)\n",
-                encoding="utf-8",
+            relative_asset = os.path.relpath(
+                imported_path.resolve(), args.output.parent.resolve()
             )
+            args.output.symlink_to(relative_asset)
         print(f"TIAGo USD ready: {args.output}", flush=True)
     finally:
         app.close()

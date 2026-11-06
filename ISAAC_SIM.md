@@ -93,3 +93,23 @@ Stop all workers with:
 ```
 
 The Gazebo workflow remains available and unchanged; Isaac output is written to a separate dataset tree.
+
+## Isaac control conventions
+
+The imported `arm_7_link` is the wrist frame, not Gazebo's grasp tool frame.
+For the bundled merged TIAGo asset, the pad midpoint is 0.241575 m along wrist
++Z. The controller rotates that axis horizontally and compensates the waypoint
+position accordingly. Recheck this transform when replacing the robot asset.
+
+The generator explicitly authors PhysX force-drive stiffness and damping before
+cloning the robot (angular: 200/10, linear: 200000/3000 in USD drive units), retaining
+the imported force limits. URDF/Newton damping does not configure PhysX position
+servos. Non-arm joints retain commanded positions during IK. Cartesian and joint
+corrections are bounded; a vertical clearance move precedes overhead positioning
+and descent. The upper-side grasp uses up to 35 mm above object center.
+
+Failed motion phases disable subsequent grasp actions for that environment;
+episode metadata includes `failure_phase`, and events contain measured and commanded
+joint positions at phase completion. Success still requires geometric enclosure
+and measured object rise; the subsequent lift uses a fixed attachment, so it is
+not evidence of a friction-only grasp or calibrated real-robot actuator behavior.

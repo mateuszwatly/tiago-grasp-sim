@@ -16,6 +16,8 @@ import math
 from pathlib import Path
 import random
 import secrets
+import sys
+import traceback
 from typing import Any
 
 from isaacsim import SimulationApp
@@ -88,7 +90,8 @@ import torch  # noqa: E402
 from isaacsim.core.api import World  # noqa: E402
 from isaacsim.core.api.objects import GroundPlane  # noqa: E402
 from isaacsim.core.cloner import GridCloner  # noqa: E402
-from isaacsim.core.prims import Articulation, RigidPrim, XFormPrim  # noqa: E402
+from isaacsim.core.prims import Articulation, RigidPrim  # noqa: E402
+from isaacsim.core.simulation_manager import SimulationManager  # noqa: E402
 from isaacsim.core.utils.stage import add_reference_to_stage  # noqa: E402
 from pxr import Gf, Sdf, Semantics, UsdGeom, UsdLux, UsdPhysics  # noqa: E402
 
@@ -294,7 +297,7 @@ class IsaacDatasetGenerator:
         self.config["episodes"] = args.episodes
         self.object_assets = json.loads(args.objects.read_text(encoding="utf-8"))
         self.random = random.Random(seed + args.worker_id * 1_000_003)
-        self.device = "cuda:0"
+        self.device = "cpu"
         self.stage = omni.usd.get_context().get_stage()
         self.frame_index = 0
         self.render_writers = []
@@ -324,12 +327,13 @@ class IsaacDatasetGenerator:
         print(f"[isaac-dataset] {event}: {fields}", flush=True)
 
     def create_world(self) -> None:
+        SimulationManager.set_device("cpu")
         settings = carb.settings.get_settings()
         settings.set("/renderer/multiGpu/enabled", args.multi_gpu_rendering)
         settings.set("/renderer/multiGpu/maxGpuCount", 2)
         settings.set("/physics/cudaDevice", 0)
-        settings.set("/physics/useGpu", True)
-        settings.set("/persistent/physics/useFabric", True)
+        settings.set("/physics/useGpu", False)
+        settings.set("/persistent/physics/useFabric", False)
 
         self.world = World(
             physics_dt=float(self.config["physics_dt"]),
@@ -346,6 +350,59 @@ class IsaacDatasetGenerator:
         UsdGeom.Scope.Define(self.stage, "/World/envs")
         UsdGeom.Xform.Define(self.stage, source_env)
         add_reference_to_stage(str(args.tiago_usd.resolve()), f"{source_env}/Tiago")
+        tiago_prim = self.stage.GetPrimAtPath(f"{source_env}/Tiago")
+        physics_variant = tiago_prim.GetVariantSets().GetVariantSet("Physics")
+        available_physics_variants = physics_variant.GetVariantNames()
+        if "physx" in available_physics_variants:
+            physics_variant.SetVariantSelection("physx")
+        elif available_physics_variants:
+            raise RuntimeError(
+                "TIAGo USD does not provide the required PhysX variant; "
+                f"available variants are {available_physics_variants}"
+            )
+        robot_root = Sdf.Path(f"{source_env}/Tiago")
+        # URDF damping (and Newton attributes) is not a PhysX position servo.
+        # Author gains before cloning/reset so every environment gets active drives.
+        for prim in self.stage.Traverse():
+            if not prim.GetPath().HasPrefix(robot_root):
+                continue
+            if prim.IsA(UsdPhysics.FixedJoint) and prim.GetName() == "root_joint":
+                # A world joint has no body0; the imported Xform is not a rigid body.
+                UsdPhysics.Joint(prim).GetBody0Rel().ClearTargets(True)
+            if prim.IsA(UsdPhysics.RevoluteJoint):
+                axis, stiffness, damping = "angular", 200.0, 10.0
+            elif prim.IsA(UsdPhysics.PrismaticJoint):
+                axis, stiffness, damping = "linear", 200000.0, 3000.0
+            else:
+                continue
+            drive = UsdPhysics.DriveAPI.Apply(prim, axis)
+            drive.CreateTypeAttr("force")
+            drive.CreateStiffnessAttr(stiffness)
+            drive.CreateDampingAttr(damping)
+            drive.CreateTargetVelocityAttr(0.0)
+
+        enabled_robot_colliders = []
+        disabled_robot_colliders = []
+        for prim in self.stage.Traverse():
+            if not prim.GetPath().HasPrefix(robot_root):
+                continue
+            if not prim.HasAPI(UsdPhysics.CollisionAPI):
+                continue
+            prim_path = str(prim.GetPath())
+            is_finger_pad = (
+                "gripper_left_finger_link" in prim_path
+                or "gripper_right_finger_link" in prim_path
+            ) and prim.GetName() == "box"
+            UsdPhysics.CollisionAPI(prim).CreateCollisionEnabledAttr(is_finger_pad)
+            destination = (
+                enabled_robot_colliders if is_finger_pad else disabled_robot_colliders
+            )
+            destination.append(prim_path)
+        self.log(
+            "robot_colliders_configured",
+            enabled=enabled_robot_colliders,
+            disabled_count=len(disabled_robot_colliders),
+        )
         create_table(self.stage, source_env, self.config)
         for slot in range(int(self.config["clutter_max_objects"])):
             create_object_slot(
@@ -369,24 +426,24 @@ class IsaacDatasetGenerator:
         cloner = GridCloner(spacing=float(self.config["environment_spacing"]))
         cloner.define_base_env("/World/envs")
         self.env_paths = cloner.generate_paths("/World/envs/env", args.num_envs)
-        self.env_origins = np.asarray(
-            cloner.clone(
-                source_prim_path=source_env,
-                prim_paths=self.env_paths,
-                replicate_physics=True,
-                base_env_path="/World/envs",
-                root_path="/World/envs/env_",
-                copy_from_source=False,
-                enable_env_ids=True,
-            ),
-            dtype=np.float32,
-        )
-        cloner.filter_collisions(
-            physicsscene_path="/World/PhysicsScene",
-            collision_root_path="/World/collisions",
-            prim_paths=self.env_paths,
-            global_paths=["/World/groundPlane"],
-        )
+        if args.num_envs == 1:
+            self.env_origins = np.zeros((1, 3), dtype=np.float32)
+        else:
+            self.env_origins = np.asarray(
+                cloner.clone(
+                    source_prim_path=source_env,
+                    prim_paths=self.env_paths,
+                    replicate_physics=True,
+                    base_env_path="/World/envs",
+                    root_path="/World/envs/env_",
+                    copy_from_source=False,
+                    enable_env_ids=True,
+                ),
+                dtype=np.float32,
+            )
+        # The grid spacing keeps environments physically disjoint. Applying
+        # collision groups to this nested mobile-manipulator articulation makes
+        # PhysX attempt to attach the imported collision shapes more than once.
 
         articulation_rel = find_relative_prim(
             self.stage, f"{source_env}/Tiago", [], require_articulation=True
@@ -416,25 +473,7 @@ class IsaacDatasetGenerator:
             name="tiago_view",
             reset_xform_properties=False,
         )
-        self.ee_links = XFormPrim(
-            prim_paths_expr=ee_paths,
-            name="tiago_end_effectors",
-            reset_xform_properties=False,
-        )
-        self.left_fingers = XFormPrim(
-            prim_paths_expr=left_finger_paths,
-            name="tiago_left_fingers",
-            reset_xform_properties=False,
-        )
-        self.right_fingers = XFormPrim(
-            prim_paths_expr=right_finger_paths,
-            name="tiago_right_fingers",
-            reset_xform_properties=False,
-        )
         self.world.scene.add(self.robots)
-        self.world.scene.add(self.ee_links)
-        self.world.scene.add(self.left_fingers)
-        self.world.scene.add(self.right_fingers)
         self.object_views = []
         for slot in range(int(self.config["clutter_max_objects"])):
             view = RigidPrim(
@@ -445,12 +484,17 @@ class IsaacDatasetGenerator:
             self.world.scene.add(view)
             self.object_views.append(view)
 
-        self.setup_replicator()
         self.world.reset()
         self.arm_indices = [self.robots.get_dof_index(name) for name in ARM_JOINTS]
         self.finger_indices = [self.robots.get_dof_index(name) for name in FINGER_JOINTS]
         self.ee_link_name = self.stage.GetPrimAtPath(ee_paths[0]).GetName()
         self.ee_link_index = self.robots.get_link_index(self.ee_link_name)
+        self.left_finger_link_index = self.robots.get_link_index(
+            self.stage.GetPrimAtPath(left_finger_paths[0]).GetName()
+        )
+        self.right_finger_link_index = self.robots.get_link_index(
+            self.stage.GetPrimAtPath(right_finger_paths[0]).GetName()
+        )
         limits = self.robots.get_dof_limits()
         self.lower_limits = limits[:, :, 0]
         self.upper_limits = limits[:, :, 1]
@@ -461,6 +505,14 @@ class IsaacDatasetGenerator:
             dof_names=list(self.robots.dof_names),
             body_names=list(self.robots.body_names),
         )
+        self.setup_replicator()
+
+    def get_link_world_poses(self, link_index: int):
+        transforms = self.robots._physics_view.get_link_transforms()
+        positions = transforms[:, link_index, :3]
+        xyzw = transforms[:, link_index, 3:7]
+        orientations = torch.cat((xyzw[:, 3:4], xyzw[:, :3]), dim=-1)
+        return positions, orientations
 
     def setup_replicator(self) -> None:
         width = int(self.config["camera_width"])
@@ -595,7 +647,7 @@ class IsaacDatasetGenerator:
                 candidate_approach = np.asarray(
                     [math.cos(candidate_yaw), math.sin(candidate_yaw)], dtype=float
                 )
-                wrist_xy = target_world[:2] - candidate_approach * 0.045
+                wrist_xy = target_world[:2] - candidate_approach * 0.241575
                 distractor_clearances = [
                     float(
                         np.linalg.norm(
@@ -610,16 +662,24 @@ class IsaacDatasetGenerator:
             best_candidate = int(np.argmax(approach_scores))
             yaw = yaw_candidates[best_candidate]
             approach = np.array([math.cos(yaw), math.sin(yaw), 0.0], dtype=np.float32)
-            grasp_position = target_world - approach * 0.045
+            grasp_position = target_world - approach * 0.241575
             grasp_position[2] = max(
                 float(self.config["table_height"]) + self.env_origins[env_index, 2] + 0.065,
-                target_world[2],
+                # Upper-side grasp retains pad overlap while avoiding the
+                # poorly tracked low-wrist pose of the imported TIAGo.
+                target_world[2] + min(0.035, 0.5 * float(
+                    target["collision_proxy"].get("height", 2 * target["collision_proxy"]["radius"])
+                )),
             )
             pregrasp = grasp_position.copy()
             pregrasp[2] += float(self.config["pregrasp_height"])
             lift = grasp_position.copy()
             lift[2] += float(self.config["lift_distance"])
-            orientation = [math.cos(yaw / 2.0), 0.0, 0.0, math.sin(yaw / 2.0)]
+            # arm_7 is the imported wrist frame, not Gazebo's grasp tool frame.
+            # The merged gripper pads lie 0.241575 m along wrist +Z.
+            c, s = math.cos(yaw / 2.0), math.sin(yaw / 2.0)
+            orientation = [c / math.sqrt(2), -s / math.sqrt(2),
+                           c / math.sqrt(2), s / math.sqrt(2)]
             target["task"] = {
                 "verb": "pick_up",
                 "target_instance_id": target["instance_id"],
@@ -678,8 +738,15 @@ class IsaacDatasetGenerator:
             padded_orientations[: len(episode_ids)] = object_orientations[slot]
             if len(episode_ids) < args.num_envs:
                 padded[len(episode_ids) :] = self.env_origins[len(episode_ids) :] + [0, 0, -2]
-            view.set_world_poses(positions=padded, orientations=padded_orientations)
-            view.set_velocities(np.zeros((args.num_envs, 6), dtype=np.float32))
+            view.set_world_poses(
+                positions=torch.as_tensor(padded, device=self.device),
+                orientations=torch.as_tensor(
+                    padded_orientations, device=self.device
+                ),
+            )
+            view.set_velocities(
+                torch.zeros((args.num_envs, 6), device=self.device)
+            )
 
         q = self.robots.get_joint_positions().clone()
         anchor = torch.tensor(
@@ -693,6 +760,7 @@ class IsaacDatasetGenerator:
             jitter = (torch.rand(7, generator=generator, device=q.device) - 0.5) * 0.06
             q[env_index, self.arm_indices] = anchor + jitter
             q[env_index, self.finger_indices] = 0.044
+        self.joint_targets = q.clone()
         self.robots.set_joint_positions(q)
         self.robots.set_joint_position_targets(q)
         for _ in range(int(self.config["settle_steps"])):
@@ -707,7 +775,7 @@ class IsaacDatasetGenerator:
         rep.orchestrator.step(rt_subframes=1, pause_timeline=False)
         q = self.robots.get_joint_positions()
         qd = self.robots.get_joint_velocities()
-        ee_positions, ee_orientations = self.ee_links.get_world_poses()
+        ee_positions, ee_orientations = self.get_link_world_poses(self.ee_link_index)
         object_positions, object_orientations = self.object_views[0].get_world_poses()
         for env_index, record in enumerate(self.episode_records):
             sample = {
@@ -731,16 +799,21 @@ class IsaacDatasetGenerator:
             record["replicator_frames"].append(self.frame_index)
         self.frame_index += 1
 
-    def move_end_effectors(self, targets, orientations, phase: str) -> list[bool]:
+    def move_end_effectors(self, targets, orientations, phase: str, active=None) -> list[bool]:
         count = len(self.episode_records)
         target_pos = torch.as_tensor(targets, device=self.device, dtype=torch.float32)
         target_quat = torch.as_tensor(orientations, device=self.device, dtype=torch.float32)
+        active = torch.as_tensor(
+            [True] * count if active is None else active, device=self.device, dtype=torch.bool
+        )
         converged = torch.zeros(count, dtype=torch.bool, device=self.device)
+        if not bool(torch.any(active)):
+            return [False] * count
         eye = torch.eye(6, device=self.device).unsqueeze(0).repeat(count, 1, 1)
         damping = float(self.config["ik_damping"])
         gain = float(self.config["ik_gain"])
         for step in range(int(self.config["phase_timeout_steps"])):
-            positions, quaternions = self.ee_links.get_world_poses()
+            positions, quaternions = self.get_link_world_poses(self.ee_link_index)
             positions = positions[:count]
             quaternions = quaternions[:count]
             position_error = target_pos - positions
@@ -752,46 +825,69 @@ class IsaacDatasetGenerator:
                 torch.linalg.norm(rotation_error, dim=-1)
                 <= float(self.config["ik_orientation_tolerance"])
             )
-            if bool(torch.all(converged)):
+            if bool(torch.all(converged | ~active)):
                 break
             jacobians = self.robots.get_jacobians()[:count]
-            jacobian_index = min(self.ee_link_index - 1, jacobians.shape[1] - 1)
-            jacobian = jacobians[:, jacobian_index, :, :][:, :, self.arm_indices]
+            fixed_base = jacobians.shape[1] == len(self.robots.body_names) - 1
+            jacobian_index = self.ee_link_index - int(fixed_base)
+            column_offset = 0 if fixed_base else 6
+            jacobian = jacobians[:, jacobian_index, :, :][:, :, [i + column_offset for i in self.arm_indices]]
+            # Bound Cartesian corrections so descent does not sweep a finger
+            # sideways through the object while solving the final waypoint.
+            position_error = position_error * torch.clamp(
+                0.01 / torch.linalg.norm(position_error, dim=-1, keepdim=True).clamp_min(1e-9), max=1.0)
+            rotation_error = rotation_error * torch.clamp(
+                0.05 / torch.linalg.norm(rotation_error, dim=-1, keepdim=True).clamp_min(1e-9), max=1.0)
             error = torch.cat((position_error, rotation_error), dim=-1).unsqueeze(-1)
             jj_t = jacobian @ jacobian.transpose(1, 2)
             delta = jacobian.transpose(1, 2) @ torch.linalg.solve(
                 jj_t + (damping * damping) * eye, error
             )
             q = self.robots.get_joint_positions()
-            arm_q = q[:count, self.arm_indices] + gain * delta.squeeze(-1)
+            arm_q = q[:count, self.arm_indices] + torch.clamp(gain * delta.squeeze(-1), -0.08, 0.08)
             arm_q = torch.maximum(
                 torch.minimum(arm_q, self.upper_limits[:count, self.arm_indices]),
                 self.lower_limits[:count, self.arm_indices],
             )
             q[:count, self.arm_indices] = torch.where(
-                converged.unsqueeze(-1), q[:count, self.arm_indices], arm_q
+                (converged | ~active).unsqueeze(-1), q[:count, self.arm_indices], arm_q
             )
-            self.robots.set_joint_position_targets(q)
+            self.joint_targets[:count, self.arm_indices] = q[:count, self.arm_indices]
+            self.robots.set_joint_position_targets(self.joint_targets)
             for _ in range(int(self.config["control_decimation"])):
                 self.world.step(render=False)
             if step % int(self.config["capture_every_control_steps"]) == 0:
                 self.capture(phase)
-        return json_value(converged)
+        self.log("motion_phase_finished", phase=phase,
+                 converged=json_value(converged & active),
+                 joint_positions=json_value(self.robots.get_joint_positions()),
+                 joint_targets=json_value(self.joint_targets))
+        return json_value(converged & active)
 
-    def command_gripper(self, openings: list[float], phase: str) -> None:
-        q = self.robots.get_joint_positions()
+    def command_gripper(self, openings: list[float], phase: str, active=None) -> None:
+        if active is not None and not any(active):
+            return
+        q = self.joint_targets.clone()
         target = torch.as_tensor(openings, device=q.device, dtype=q.dtype).unsqueeze(-1)
+        if active is not None:
+            mask = torch.as_tensor(active, device=q.device).unsqueeze(-1)
+            target = torch.where(mask, target, q[:len(openings), self.finger_indices])
         q[: len(openings), self.finger_indices] = target
+        self.joint_targets = q
         self.robots.set_joint_position_targets(q)
         for step in range(30):
             self.world.step(render=False)
             if step % 2 == 0:
                 self.capture(phase)
 
-    def attach_targets(self) -> list[bool]:
+    def attach_targets(self, active=None) -> list[bool]:
         object_positions, object_orientations = self.object_views[0].get_world_poses()
-        left_positions, left_orientations = self.left_fingers.get_world_poses()
-        right_positions, right_orientations = self.right_fingers.get_world_poses()
+        left_positions, left_orientations = self.get_link_world_poses(
+            self.left_finger_link_index
+        )
+        right_positions, right_orientations = self.get_link_world_poses(
+            self.right_finger_link_index
+        )
         attached = []
         for env_index, record in enumerate(self.episode_records):
             object_position = np.asarray(
@@ -829,7 +925,8 @@ class IsaacDatasetGenerator:
             minimum_separation = object_diameter + 0.004
             maximum_separation = object_diameter + 0.018
             valid = (
-                minimum_separation <= horizontal_separation <= maximum_separation
+                (active is None or active[env_index])
+                and minimum_separation <= horizontal_separation <= maximum_separation
                 and abs(float(separation_vector[2])) <= 0.012
                 and midpoint_xy_error <= 0.012
                 and vertical_overlap >= 0.005
@@ -916,6 +1013,10 @@ class IsaacDatasetGenerator:
                     "minimum_verified_lift": float(
                         self.config["minimum_verified_lift"]
                     ),
+                    "failure_phase": next(
+                        (key for key, value in phase_results.items() if not value[env_index]),
+                        None if success else "lift_verification",
+                    ),
                     "phase_results": {
                         key: bool(value[env_index])
                         for key, value in phase_results.items()
@@ -970,20 +1071,32 @@ class IsaacDatasetGenerator:
         pregrasp = [record["waypoints"]["pregrasp"] for record in self.episode_records]
         grasp = [record["waypoints"]["grasp"] for record in self.episode_records]
         lift = [record["waypoints"]["lift"] for record in self.episode_records]
+        # Clear the tabletop before rotating/sweeping the long imported fingers.
+        current_positions, current_orientations = self.get_link_world_poses(self.ee_link_index)
+        clearance = current_positions[:count].clone()
+        clearance[:, 2] = torch.maximum(clearance[:, 2],
+            torch.as_tensor([p[2] + 0.10 for p in pregrasp], device=self.device))
         phase_results = {}
+        phase_results["clearance"] = self.move_end_effectors(
+            clearance, current_orientations[:count], "clearance"
+        )
+        overhead = [[p[0], p[1], p[2] + 0.10] for p in pregrasp]
+        phase_results["overhead"] = self.move_end_effectors(
+            overhead, orientations, "overhead", phase_results["clearance"]
+        )
         phase_results["pregrasp"] = self.move_end_effectors(
-            pregrasp, orientations, "pregrasp"
+            pregrasp, orientations, "pregrasp", phase_results["overhead"]
         )
         phase_results["approach"] = self.move_end_effectors(
-            grasp, orientations, "approach"
+            grasp, orientations, "approach", phase_results["pregrasp"]
         )
         openings = [
             min(0.044, float(record["target"]["collision_proxy"].get("radius", 0.03)) + 0.005)
             for record in self.episode_records
         ]
-        self.command_gripper(openings, "close_gripper")
-        phase_results["enclosure"] = self.attach_targets()
-        phase_results["lift"] = self.move_end_effectors(lift, orientations, "lift")
+        self.command_gripper(openings, "close_gripper", phase_results["approach"])
+        phase_results["enclosure"] = self.attach_targets(phase_results["approach"])
+        phase_results["lift"] = self.move_end_effectors(lift, orientations, "lift", phase_results["enclosure"])
         for _ in range(int(self.config["settle_steps"])):
             self.world.step(render=False)
         self.capture("hold_after_lift")
@@ -1047,20 +1160,26 @@ class IsaacDatasetGenerator:
             self.world.stop()
 
 
-def main() -> None:
+def main() -> int:
     generator = IsaacDatasetGenerator()
+    exit_code = 0
     try:
         generator.run()
     except Exception as error:
-        generator.log("session_failed", error=repr(error))
+        generator.log(
+            "session_failed",
+            error=repr(error),
+            traceback=traceback.format_exc(),
+        )
         generator.write_summary(final=False)
-        raise
+        exit_code = 1
     finally:
         try:
             generator.close()
         finally:
             app.close()
+    return exit_code
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
