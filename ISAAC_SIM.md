@@ -148,3 +148,12 @@ Each batch rebuilds physics handles after removing grasp attachments, resets joi
 positions and velocities, and drains camera writes before publishing its episode
 indexes. Environment clones have independent USD/physics state. Failed or waiting
 environments retain their motor targets while other environments finish.
+
+## Machine-learning exports and richer capture
+
+See [the dataset contract](isaac_sim/DATASET.md) for export commands, the NumPy loader,
+action semantics, time alignment, splits, privileged-state rules, and modality units.
+Use `ISAAC_PROFILE=rich` to retain 1280x960 RGB-D plus normals, motion vectors and
+radial depth. New sessions also retain control-rate commands, all-object state,
+robot-link poses and joint reaction measurements. Existing sessions can be exported
+without inventing commands or modalities they did not record.

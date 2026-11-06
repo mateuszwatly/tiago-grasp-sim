@@ -10,6 +10,7 @@ after geometric enclosure and a measured object rise.
 from __future__ import annotations
 
 import argparse
+import hashlib
 from datetime import datetime, timezone
 import json
 import math
@@ -53,7 +54,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--worker-count", type=int, default=1)
     parser.add_argument("--renderer", default="RaytracedLighting")
     parser.add_argument("--multi-gpu-rendering", action="store_true")
-    parser.add_argument("--profile", choices=["quality", "fast"], default="quality")
+    parser.add_argument("--profile", choices=["quality", "fast", "rich", "rich-fast"], default="quality")
     parser.add_argument("--duration-hours", type=float, default=0.0)
     parser.add_argument("--min-free-gb", type=float, default=20.0)
     parsed = parser.parse_args()
@@ -306,7 +307,7 @@ def quaternion_delta_rotvec(current, following) -> list[float]:
 class IsaacDatasetGenerator:
     def __init__(self) -> None:
         self.config = dict(base_config)
-        if args.profile == "fast":
+        if args.profile in ("fast", "rich-fast"):
             self.config.update(camera_width=640, camera_height=480,
                                capture_every_control_steps=6)
         self.started_at = time.monotonic()
@@ -333,7 +334,8 @@ class IsaacDatasetGenerator:
         self.events_path = self.session_dir / "events.jsonl"
         (self.session_dir / "config.json").write_text(json.dumps(
             {"generator": self.config, "objects": self.object_assets,
-             "seed": seed, "profile": args.profile}, indent=2))
+             "seed": seed, "profile": args.profile,
+             "generator_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest()}, indent=2))
         self.log(
             "session_started",
             episodes=args.episodes,
@@ -554,6 +556,9 @@ class IsaacDatasetGenerator:
                         self.session_dir / "cameras" / f"env_{env_index:02d}" / camera_name
                     ),
                     rgb=True,
+                    normals=args.profile in ("rich", "rich-fast"),
+                    motion_vectors=args.profile in ("rich", "rich-fast"),
+                    distance_to_camera=args.profile in ("rich", "rich-fast"),
                     distance_to_image_plane=True,
                     semantic_segmentation=True,
                     colorize_semantic_segmentation=False,
@@ -570,6 +575,7 @@ class IsaacDatasetGenerator:
     def configure_batch(self, episode_ids: list[int]) -> None:
         self.active_episode_ids = episode_ids
         self.trajectories = [[] for _ in episode_ids]
+        self.control_records = [[] for _ in episode_ids]
         self.episode_records = []
         count_positions = [
             (x, y)
@@ -716,7 +722,8 @@ class IsaacDatasetGenerator:
             }
             self.episode_records.append(
                 {
-                    "schema_version": 3,
+                    "schema_version": 4,
+                    "environment_origin_world": self.env_origins[env_index].tolist(),
                     "episode_id": episode_id,
                     "worker_id": args.worker_id,
                     "environment_index": env_index,
@@ -803,12 +810,30 @@ class IsaacDatasetGenerator:
         rep.orchestrator.step(rt_subframes=1, pause_timeline=False)
         q = self.robots.get_joint_positions()
         qd = self.robots.get_joint_velocities()
+        efforts = self.robots.get_measured_joint_efforts()
+        reactions = self.robots.get_measured_joint_forces()
         ee_positions, ee_orientations = self.get_link_world_poses(self.ee_link_index)
         object_positions, object_orientations = self.object_views[0].get_world_poses()
+        all_objects = [view.get_world_poses() for view in self.object_views]
+        object_velocities = [view.get_velocities() for view in self.object_views]
+        links = self.robots._physics_view.get_link_transforms().clone()
         for env_index, record in enumerate(self.episode_records):
             sample = {
                 "step_index": len(self.trajectories[env_index]),
                 "physics_step": int(self.world.current_time_step_index),
+                "simulation_time_seconds": float(self.world.current_time),
+                "joint_position_targets": json_value(self.joint_targets[env_index]),
+                "robot_link_names": list(self.robots.body_names),
+                "robot_link_world_pose_xyzw": json_value(links[env_index]),
+                "all_object_states": [
+                    {"instance_id": obj["instance_id"],
+                     "position": json_value(all_objects[obj["slot"]][0][env_index]),
+                     "orientation_wxyz": json_value(all_objects[obj["slot"]][1][env_index]),
+                     "velocity_linear_angular": json_value(object_velocities[obj["slot"]][env_index])}
+                    for obj in record["objects"]
+                ],
+                "attachment_active": self.stage.GetPrimAtPath(
+                    f"{self.env_paths[env_index]}/grasp_attachment").IsValid(),
                 "replicator_frame": self.frame_index,
                 "phase": phase,
                 "end_effector_position": json_value(ee_positions[env_index]),
@@ -816,6 +841,8 @@ class IsaacDatasetGenerator:
                 "joint_names": list(self.robots.dof_names),
                 "joint_positions": json_value(q[env_index]),
                 "joint_velocities": json_value(qd[env_index]),
+                "joint_efforts": json_value(efforts[env_index]) if efforts is not None else None,
+                "link_incoming_joint_wrench_local": json_value(reactions[env_index]) if reactions is not None else None,
                 "target_object_position": json_value(object_positions[env_index]),
                 "target_object_orientation_wxyz": json_value(object_orientations[env_index]),
                 "camera_paths": {
@@ -826,6 +853,19 @@ class IsaacDatasetGenerator:
             self.trajectories[env_index].append(sample)
             record["replicator_frames"].append(self.frame_index)
         self.frame_index += 1
+
+    def record_control(self, phase: str, start_time: float, before, command) -> None:
+        after = self.robots.get_joint_positions()
+        velocities = self.robots.get_joint_velocities()
+        for i in range(len(self.episode_records)):
+            self.control_records[i].append({
+                "phase": phase, "start_time_seconds": start_time,
+                "end_time_seconds": float(self.world.current_time),
+                "joint_positions_before": json_value(before[i]),
+                "joint_position_command": json_value(command[i]),
+                "joint_positions_after": json_value(after[i]),
+                "joint_velocities_after": json_value(velocities[i]),
+            })
 
     def move_end_effectors(self, targets, orientations, phase: str, active=None) -> list[bool]:
         count = len(self.episode_records)
@@ -881,9 +921,13 @@ class IsaacDatasetGenerator:
                 (converged | ~active).unsqueeze(-1), self.joint_targets[:count, self.arm_indices], arm_q
             )
             self.joint_targets[:count, self.arm_indices] = q[:count, self.arm_indices]
+            control_start = float(self.world.current_time)
+            before = self.robots.get_joint_positions().clone()
+            command = self.joint_targets.clone()
             self.robots.set_joint_position_targets(self.joint_targets)
             for _ in range(int(self.config["control_decimation"])):
                 self.world.step(render=False)
+            self.record_control(phase, control_start, before, command)
             if step % int(self.config["capture_every_control_steps"]) == 0:
                 self.capture(phase)
         positions, quaternions = self.get_link_world_poses(self.ee_link_index)
@@ -912,7 +956,11 @@ class IsaacDatasetGenerator:
         self.joint_targets = q
         self.robots.set_joint_position_targets(q)
         for step in range(30):
+            control_start = float(self.world.current_time)
+            before = self.robots.get_joint_positions().clone()
+            command = self.joint_targets.clone()
             self.world.step(render=False)
+            self.record_control(phase, control_start, before, command)
             if step % 2 == 0:
                 self.capture(phase)
 
@@ -1043,6 +1091,8 @@ class IsaacDatasetGenerator:
                 all(result[env_index] for result in phase_results.values())
                 and rise >= float(self.config["minimum_verified_lift"])
             )
+            if args.profile in ("rich", "rich-fast"):
+                record["camera_modalities"] += ["normals", "motion_vectors", "distance_to_camera"]
             record.update(
                 {
                     "status": "completed" if success else "failed",
@@ -1075,6 +1125,7 @@ class IsaacDatasetGenerator:
                     sample["end_effector_orientation_wxyz"],
                     following["end_effector_orientation_wxyz"],
                 )
+                sample["action_semantics"] = "observed_next_frame_motion_not_command"
                 sample["action"] = {
                     "representation": "delta_end_effector_rotvec_gripper_terminate",
                     "values": delta_position
@@ -1090,6 +1141,9 @@ class IsaacDatasetGenerator:
                 }
             episode_dir = self.session_dir / "episodes" / f"episode_{record['episode_id']:06d}"
             episode_dir.mkdir(parents=True, exist_ok=True)
+            with (episode_dir / "controls.jsonl").open("w") as stream:
+                for control in self.control_records[env_index]:
+                    stream.write(json.dumps(control) + "\n")
             (episode_dir / "metadata.json").write_text(
                 json.dumps(record, indent=2, sort_keys=True), encoding="utf-8"
             )
