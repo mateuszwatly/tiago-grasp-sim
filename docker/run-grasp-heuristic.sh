@@ -14,9 +14,10 @@ for _ in $(seq 1 120); do
   controllers=$(timeout 5s ros2 control list_controllers 2>/dev/null || true)
   if grep -Eq '^arm_controller[[:space:]].*[[:space:]]active$' <<<"${controllers}" \
       && grep -Eq '^gripper_controller[[:space:]].*[[:space:]]active$' <<<"${controllers}"; then
-    # Dataset launch disables the upstream tuck motion, so only a short
-    # controller stabilization period is needed.
-    sleep 5
+    # Let the upstream tuck motion finish before this process starts sending
+    # goals to the same arm controller. This one-time delay avoids starting
+    # MoveIt from the raw spawn configuration.
+    sleep 30
     ros2 param set /arm_controller constraints.goal_time 15.0 >/dev/null
     exec ros2 launch tiago_grasp_dataset run_heuristic.launch.py \
       use_sim_time:=True \
