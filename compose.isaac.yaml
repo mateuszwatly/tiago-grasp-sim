@@ -1,0 +1,48 @@
+x-isaac-worker: &isaac-worker
+  image: ${ISAAC_SIM_IMAGE:-nvcr.io/nvidia/isaac-sim:6.2.0}
+  network_mode: host
+  ipc: host
+  shm_size: 16gb
+  user: "0:0"
+  working_dir: /workspace
+  gpus: all
+  ulimits:
+    memlock: -1
+    stack: 67108864
+  environment: &isaac-environment
+    ACCEPT_EULA: ${ACCEPT_EULA:-N}
+    PRIVACY_CONSENT: ${PRIVACY_CONSENT:-N}
+    NVIDIA_DRIVER_CAPABILITIES: all
+    NUM_ENVS: ${NUM_ENVS:-4}
+    EPISODES: ${EPISODES:-300}
+    DATASET_SEED: ${DATASET_SEED:-0}
+    WORKER_COUNT: ${WORKER_COUNT:-1}
+    ISAAC_RENDERER: ${ISAAC_RENDERER:-RaytracedLighting}
+    ISAAC_MULTI_GPU_RENDERING: ${ISAAC_MULTI_GPU_RENDERING:-false}
+    ISAAC_OUTPUT_ROOT: /workspace/ready_datasets/isaac_clutter_pick
+  volumes:
+    - ./:/workspace:rw
+    - ./.isaac_cache/main:/isaac-sim/.cache:rw
+    - ./.isaac_cache/computecache:/isaac-sim/.nv/ComputeCache:rw
+    - ./.isaac_cache/kit:/isaac-sim/kit/cache:rw
+    - ./.isaac_cache/logs:/isaac-sim/.nvidia-omniverse/logs:rw
+    - ./.isaac_cache/config:/isaac-sim/.nvidia-omniverse/config:rw
+    - ./.isaac_cache/data:/isaac-sim/.local/share/ov/data:rw
+  entrypoint: ["bash", "/workspace/isaac_sim/docker/entrypoint.sh"]
+  restart: "no"
+
+services:
+  isaac-worker-0:
+    <<: *isaac-worker
+    environment:
+      <<: *isaac-environment
+      NVIDIA_VISIBLE_DEVICES: ${ISAAC_GPU_0:-0}
+      WORKER_ID: 0
+
+  isaac-worker-1:
+    <<: *isaac-worker
+    profiles: ["dual-gpu"]
+    environment:
+      <<: *isaac-environment
+      NVIDIA_VISIBLE_DEVICES: ${ISAAC_GPU_1:-1}
+      WORKER_ID: 1

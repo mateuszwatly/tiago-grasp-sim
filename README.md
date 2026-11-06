@@ -2,6 +2,8 @@
 
 This project builds a pinned ROS 2 Jazzy + Gazebo Harmonic environment with a single-arm TIAGo, the PAL two-finger gripper, MoveIt 2, a 1280x960 RGB-D head camera, and a randomized tabletop scene.
 
+An independent [Isaac Sim 6.2 dataset generator](ISAAC_SIM.md) is also available for GPU-parallel clutter generation, two-camera RGB-D/segmentation capture, and optional Gaussian-splat object appearances. It preserves this Gazebo workflow as the validated reference implementation.
+
 The simulation and grasp policy are separate processes. Starting the stack launches Gazebo, TIAGo, and the scene manager only. The scene manager owns the table and object lifecycle and publishes object geometry and pose; it does not choose an end-effector target, gripper aperture, or motion. A heuristic, learned policy, teleoperation node, or another controller can consume the same interface without changing the simulator.
 
 ## Build and start the simulation

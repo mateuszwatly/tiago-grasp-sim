@@ -9,3 +9,6 @@ datasets/*
 !datasets/.gitkeep
 ready_datasets/*
 !ready_datasets/.gitkeep
+.isaac_cache/
+isaac_sim/assets/tiago_source/
+isaac_sim/assets/generated/
