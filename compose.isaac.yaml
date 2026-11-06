@@ -5,7 +5,13 @@ x-isaac-worker: &isaac-worker
   shm_size: 16gb
   user: "0:0"
   working_dir: /workspace
-  gpus: all
+  deploy:
+    resources:
+      reservations:
+        devices:
+          - driver: nvidia
+            count: all
+            capabilities: [gpu]
   ulimits:
     memlock: -1
     stack: 67108864

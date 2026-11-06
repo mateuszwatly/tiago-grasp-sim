@@ -30,6 +30,13 @@ if [[ ! -f "$env_file" ]]; then
   exit 2
 fi
 
+if [[ "$command_name" == "start" || "$command_name" == "start-dual" ]]; then
+  if ! grep -Eq '^ACCEPT_EULA=Y([[:space:]]*)$' "$env_file"; then
+    echo "Isaac Sim was not started: .env.isaac must contain ACCEPT_EULA=Y after you review and accept NVIDIA's terms." >&2
+    exit 2
+  fi
+fi
+
 compose=(docker compose --env-file "$env_file" -f "$compose_file")
 mkdir -p \
   "$repo_root/.isaac_cache"/{main,computecache,kit,logs,config,data} \

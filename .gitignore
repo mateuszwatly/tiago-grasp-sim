@@ -1,4 +1,5 @@
 .env
+.env.isaac
 .docker.xauth
 __pycache__/
 *.py[cod]

@@ -26,6 +26,8 @@ First verify GPU access from Docker:
 docker run --rm --gpus all ubuntu:24.04 nvidia-smi
 ```
 
+Do not continue if this reports `could not select device driver ... gpu`; that means NVIDIA Container Toolkit is not yet configured for Docker.
+
 The current host must expose every intended GPU in that output. `start-dual` assigns worker 0 to GPU 0 and worker 1 to GPU 1.
 
 ## Configure and start
