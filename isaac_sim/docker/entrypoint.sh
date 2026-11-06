@@ -35,9 +35,21 @@ generator_args=(
   --worker-id "${WORKER_ID:-0}"
   --worker-count "${WORKER_COUNT:-1}"
   --renderer "${ISAAC_RENDERER:-RaytracedLighting}"
+  --profile "${ISAAC_PROFILE:-quality}"
+  --duration-hours "${DURATION_HOURS:-0}"
+  --min-free-gb "${MIN_FREE_GB:-20}"
 )
 if [[ "${ISAAC_MULTI_GPU_RENDERING:-false}" == "true" ]]; then
   generator_args+=(--multi-gpu-rendering)
 fi
 
-exec /isaac-sim/python.sh "${generator_args[@]}"
+# NVIDIA's python.sh does not exec Python or forward termination signals.
+# Forward signals to its Python child and keep the wrapper alive to wait.
+/isaac-sim/python.sh "${generator_args[@]}" &
+generator_pid=$!
+trap 'pkill -TERM -P "$generator_pid" 2>/dev/null || true' TERM INT
+status=0
+while kill -0 "$generator_pid" 2>/dev/null; do
+  wait "$generator_pid" && status=0 || status=$?
+done
+exit "$status"

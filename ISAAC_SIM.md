@@ -113,3 +113,38 @@ episode metadata includes `failure_phase`, and events contain measured and comma
 joint positions at phase completion. Success still requires geometric enclosure
 and measured object rise; the subsequent lift uses a fixed attachment, so it is
 not evidence of a friction-only grasp or calibrated real-robot actuator behavior.
+
+## Longer runs and selecting successes
+
+For a bounded fast recording run on one GPU:
+
+```bash
+ISAAC_PROFILE=fast NUM_ENVS=2 EPISODES=100000 DURATION_HOURS=4 \
+  MIN_FREE_GB=20 DATASET_SEED=240645649 ./scripts/isaac.sh start
+```
+
+`fast` records both cameras at 640x480 every six control steps; `quality` retains
+1280x960 every three steps. Physics timestep and control decimation are unchanged.
+The simulation runs without real-time pacing. Throughput depends on GPU, scene,
+failed-phase timeouts, and recording I/O; faster capture is not higher physics speed.
+
+The duration limit is wall-clock time from generator initialization (after Isaac
+application startup), checked between batches.
+The episode count is an additional cap. Free disk space is checked before every
+batch; reserve enough for a whole batch. Completed episodes are retained on stop.
+SIGINT/SIGTERM request a stop between batches. `scripts/isaac.sh stop` allows up to
+ten minutes for shutdown and camera writes. Restarting creates a new session;
+it does not resume or overwrite the previous session.
+
+Each session stores the effective configuration, an atomically updated summary,
+`episodes.jsonl` for every finished attempt, and `successes.jsonl` for successful
+attempts (created on the first success). Index entries point to metadata and
+trajectories and identify camera environment and frame numbers. Camera files are
+shared across the session: retain the referenced frames when extracting episodes.
+Failed attempts remain available for analysis. These success labels include the
+geometrically gated attachment described above, not friction-only grasp validation.
+
+Each batch rebuilds physics handles after removing grasp attachments, resets joint
+positions and velocities, and drains camera writes before publishing its episode
+indexes. Environment clones have independent USD/physics state. Failed or waiting
+environments retain their motor targets while other environments finish.

@@ -21,6 +21,9 @@ x-isaac-worker: &isaac-worker
     NVIDIA_DRIVER_CAPABILITIES: all
     NUM_ENVS: ${NUM_ENVS:-4}
     EPISODES: ${EPISODES:-300}
+    ISAAC_PROFILE: ${ISAAC_PROFILE:-quality}
+    DURATION_HOURS: ${DURATION_HOURS:-0}
+    MIN_FREE_GB: ${MIN_FREE_GB:-20}
     DATASET_SEED: ${DATASET_SEED:-0}
     WORKER_COUNT: ${WORKER_COUNT:-1}
     ISAAC_RENDERER: ${ISAAC_RENDERER:-RaytracedLighting}
@@ -35,6 +38,7 @@ x-isaac-worker: &isaac-worker
     - ./.isaac_cache/config:/isaac-sim/.nvidia-omniverse/config:rw
     - ./.isaac_cache/data:/isaac-sim/.local/share/ov/data:rw
   entrypoint: ["bash", "/workspace/isaac_sim/docker/entrypoint.sh"]
+  stop_grace_period: 10m
   restart: "no"
 
 services:

@@ -16,6 +16,9 @@ import math
 from pathlib import Path
 import random
 import secrets
+import signal
+import shutil
+import time
 import sys
 import traceback
 from typing import Any
@@ -50,7 +53,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--worker-count", type=int, default=1)
     parser.add_argument("--renderer", default="RaytracedLighting")
     parser.add_argument("--multi-gpu-rendering", action="store_true")
-    return parser.parse_args()
+    parser.add_argument("--profile", choices=["quality", "fast"], default="quality")
+    parser.add_argument("--duration-hours", type=float, default=0.0)
+    parser.add_argument("--min-free-gb", type=float, default=20.0)
+    parsed = parser.parse_args()
+    if parsed.episodes < 1 or parsed.num_envs < 1 or parsed.worker_count < 1:
+        parser.error("episodes, num-envs, and worker-count must be positive")
+    if not 0 <= parsed.worker_id < parsed.worker_count:
+        parser.error("worker-id must be within worker-count")
+    if parsed.duration_hours < 0 or parsed.min_free_gb < 0:
+        parser.error("duration-hours and min-free-gb cannot be negative")
+    return parsed
 
 
 def utc_now() -> str:
@@ -293,6 +306,13 @@ def quaternion_delta_rotvec(current, following) -> list[float]:
 class IsaacDatasetGenerator:
     def __init__(self) -> None:
         self.config = dict(base_config)
+        if args.profile == "fast":
+            self.config.update(camera_width=640, camera_height=480,
+                               capture_every_control_steps=6)
+        self.started_at = time.monotonic()
+        self.stop_requested = False
+        signal.signal(signal.SIGTERM, self.request_stop)
+        signal.signal(signal.SIGINT, self.request_stop)
         self.config["num_envs"] = args.num_envs
         self.config["episodes"] = args.episodes
         self.object_assets = json.loads(args.objects.read_text(encoding="utf-8"))
@@ -311,6 +331,9 @@ class IsaacDatasetGenerator:
         self.session_dir = args.output / f"isaac_{session_stamp}_worker{args.worker_id}_seed{seed}"
         self.session_dir.mkdir(parents=True, exist_ok=False)
         self.events_path = self.session_dir / "events.jsonl"
+        (self.session_dir / "config.json").write_text(json.dumps(
+            {"generator": self.config, "objects": self.object_assets,
+             "seed": seed, "profile": args.profile}, indent=2))
         self.log(
             "session_started",
             episodes=args.episodes,
@@ -319,6 +342,9 @@ class IsaacDatasetGenerator:
             worker_count=args.worker_count,
             seed=seed,
         )
+
+    def request_stop(self, *_args) -> None:
+        self.stop_requested = True
 
     def log(self, event: str, **fields) -> None:
         record = {"wall_time": utc_now(), "event": event, **fields}
@@ -433,10 +459,10 @@ class IsaacDatasetGenerator:
                 cloner.clone(
                     source_prim_path=source_env,
                     prim_paths=self.env_paths,
-                    replicate_physics=True,
+                    replicate_physics=False,
                     base_env_path="/World/envs",
                     root_path="/World/envs/env_",
-                    copy_from_source=False,
+                    copy_from_source=True,
                     enable_env_ids=True,
                 ),
                 dtype=np.float32,
@@ -485,6 +511,7 @@ class IsaacDatasetGenerator:
             self.object_views.append(view)
 
         self.world.reset()
+        self.reset_joint_positions = self.robots.get_joint_positions().clone()
         self.arm_indices = [self.robots.get_dof_index(name) for name in ARM_JOINTS]
         self.finger_indices = [self.robots.get_dof_index(name) for name in FINGER_JOINTS]
         self.ee_link_name = self.stage.GetPrimAtPath(ee_paths[0]).GetName()
@@ -748,7 +775,7 @@ class IsaacDatasetGenerator:
                 torch.zeros((args.num_envs, 6), device=self.device)
             )
 
-        q = self.robots.get_joint_positions().clone()
+        q = self.reset_joint_positions.clone()
         anchor = torch.tensor(
             [0.17, -0.27, -1.35, 2.28, 1.22, 0.92, 1.57],
             device=q.device,
@@ -762,6 +789,7 @@ class IsaacDatasetGenerator:
             q[env_index, self.finger_indices] = 0.044
         self.joint_targets = q.clone()
         self.robots.set_joint_positions(q)
+        self.robots.set_joint_velocities(torch.zeros_like(q))
         self.robots.set_joint_position_targets(q)
         for _ in range(int(self.config["settle_steps"])):
             self.world.step(render=False)
@@ -850,7 +878,7 @@ class IsaacDatasetGenerator:
                 self.lower_limits[:count, self.arm_indices],
             )
             q[:count, self.arm_indices] = torch.where(
-                (converged | ~active).unsqueeze(-1), q[:count, self.arm_indices], arm_q
+                (converged | ~active).unsqueeze(-1), self.joint_targets[:count, self.arm_indices], arm_q
             )
             self.joint_targets[:count, self.arm_indices] = q[:count, self.arm_indices]
             self.robots.set_joint_position_targets(self.joint_targets)
@@ -858,6 +886,14 @@ class IsaacDatasetGenerator:
                 self.world.step(render=False)
             if step % int(self.config["capture_every_control_steps"]) == 0:
                 self.capture(phase)
+        positions, quaternions = self.get_link_world_poses(self.ee_link_index)
+        converged = (
+            torch.linalg.norm(target_pos - positions[:count], dim=-1)
+            <= float(self.config["ik_position_tolerance"])
+        ) & (
+            torch.linalg.norm(quaternion_error(target_quat, quaternions[:count]), dim=-1)
+            <= float(self.config["ik_orientation_tolerance"])
+        )
         self.log("motion_phase_finished", phase=phase,
                  converged=json_value(converged & active),
                  joint_positions=json_value(self.robots.get_joint_positions()),
@@ -995,6 +1031,10 @@ class IsaacDatasetGenerator:
 
     def finish_batch(self, phase_results: dict[str, list[bool]]) -> None:
         final_positions, _ = self.object_views[0].get_world_poses()
+        final_positions = final_positions.clone()
+        # Replicator completion can stop the timeline and invalidate tensor views.
+        # Snapshot the physical outcome first, then drain writes before indexing.
+        rep.orchestrator.wait_until_complete()
         for env_index, record in enumerate(self.episode_records):
             initial = np.asarray(record["initial_target_world_position"], dtype=float)
             final = np.asarray(json_value(final_positions[env_index]), dtype=float)
@@ -1062,9 +1102,23 @@ class IsaacDatasetGenerator:
                 object_rise=rise,
                 trajectory_samples=len(trajectory),
             )
-            self.all_records.append(record)
+            index_record = {
+                "episode_id": record["episode_id"], "success": success,
+                "failure_phase": record["failure_phase"], "object_rise": rise,
+                "target": record["target"]["type"],
+                "metadata": str(episode_dir.relative_to(self.session_dir) / "metadata.json"),
+                "trajectory": str(episode_dir.relative_to(self.session_dir) / "trajectory.jsonl"),
+                "environment_index": env_index, "replicator_frames": record["replicator_frames"],
+            }
+            for index_name in (["episodes.jsonl", "successes.jsonl"] if success else ["episodes.jsonl"]):
+                with (self.session_dir / index_name).open("a") as stream:
+                    stream.write(json.dumps(index_record) + "\n")
+            self.all_records.append({"success": success})
 
     def run_batch(self, episode_ids: list[int]) -> None:
+        # Removing a successful grasp's fixed joint invalidates PhysX views.
+        # Rebuild handles before touching articulation/object tensors again.
+        self.world.reset()
         self.configure_batch(episode_ids)
         count = len(episode_ids)
         orientations = [record["waypoints"]["orientation_wxyz"] for record in self.episode_records]
@@ -1102,7 +1156,9 @@ class IsaacDatasetGenerator:
         self.capture("hold_after_lift")
         self.finish_batch(phase_results)
         for env_index in range(count):
-            self.stage.RemovePrim(f"{self.env_paths[env_index]}/grasp_attachment")
+            path = f"{self.env_paths[env_index]}/grasp_attachment"
+            if self.stage.GetPrimAtPath(path).IsValid():
+                self.stage.RemovePrim(path)
 
     def write_summary(self, final: bool) -> None:
         summary = {
@@ -1116,6 +1172,9 @@ class IsaacDatasetGenerator:
             "completed": sum(bool(record["success"]) for record in self.all_records),
             "failed": sum(not bool(record["success"]) for record in self.all_records),
             "final": final,
+            "profile": args.profile,
+            "elapsed_seconds": time.monotonic() - self.started_at,
+            "stop_reason": getattr(self, "stop_reason", None),
             "num_parallel_environments": args.num_envs,
             "renderer": args.renderer,
             "camera_resolution": [
@@ -1134,15 +1193,28 @@ class IsaacDatasetGenerator:
                 "object pose",
             ],
         }
-        (self.session_dir / "summary.json").write_text(
+        summary_path = self.session_dir / "summary.json"
+        temporary_path = summary_path.with_suffix(".tmp")
+        temporary_path.write_text(
             json.dumps(summary, indent=2, sort_keys=True), encoding="utf-8"
         )
+
+        temporary_path.replace(summary_path)
 
     def run(self) -> None:
         self.all_records: list[dict[str, Any]] = []
         self.assigned_ids = list(range(args.worker_id + 1, args.episodes + 1, args.worker_count))
         self.create_world()
         for start in range(0, len(self.assigned_ids), args.num_envs):
+            if self.stop_requested:
+                self.stop_reason = "signal"
+                break
+            if args.duration_hours and time.monotonic() - self.started_at >= args.duration_hours * 3600:
+                self.stop_reason = "duration_limit"
+                break
+            if shutil.disk_usage(self.session_dir).free < args.min_free_gb * 1024**3:
+                self.stop_reason = "disk_reserve"
+                break
             self.run_batch(self.assigned_ids[start : start + args.num_envs])
             self.write_summary(final=False)
         self.write_summary(final=True)
