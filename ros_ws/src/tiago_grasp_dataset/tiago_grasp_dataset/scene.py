@@ -151,13 +151,41 @@ class GazeboScene:
             "-name", name, "-string", sdf, "-x", str(x), "-y", str(y),
             "-z", str(z), "-Y", str(yaw),
         ]
+        last_error = ""
         for attempt in range(1, 31):
-            result = subprocess.run(command, capture_output=True, text=True, timeout=15)
+            try:
+                result = subprocess.run(
+                    command, capture_output=True, text=True, timeout=15
+                )
+            except subprocess.TimeoutExpired as error:
+                last_error = f"timed out after {error.timeout} seconds"
+                # The create request can succeed in Gazebo even when its ROS
+                # client times out waiting for the response. Accept that case
+                # instead of retrying the same model name indefinitely.
+                try:
+                    probe = subprocess.run(
+                        ["gz", "model", "-m", name, "-p"],
+                        capture_output=True,
+                        text=True,
+                        timeout=5,
+                    )
+                    if probe.returncode == 0 and "Pose [ XYZ (m) ]" in probe.stdout:
+                        self.node.get_logger().info(
+                            f"Spawned {name}; create response timed out"
+                        )
+                        return
+                except subprocess.TimeoutExpired:
+                    pass
+                if attempt < 30:
+                    time.sleep(2)
+                    continue
+                raise RuntimeError(f"Unable to spawn {name}: {last_error}")
             if result.returncode == 0:
                 self.node.get_logger().info(f"Spawned {name}")
                 return
+            last_error = (result.stderr or result.stdout).strip()
             if attempt == 30:
-                raise RuntimeError(f"Unable to spawn {name}: {result.stderr or result.stdout}")
+                raise RuntimeError(f"Unable to spawn {name}: {last_error}")
             time.sleep(2)
 
     def remove(self, name):
@@ -165,19 +193,35 @@ class GazeboScene:
             "ros2", "run", "ros_gz_sim", "remove", "--ros-args",
             "-p", "world:=default", "-p", f"entity_name:={name}",
         ]
-        result = subprocess.run(command, capture_output=True, text=True, timeout=15)
-        if result.returncode != 0:
-            raise RuntimeError(f"Unable to remove {name}: {result.stderr or result.stdout}")
-        self.node.get_logger().info(f"Removed {name}")
+        last_error = ""
+        for attempt in range(5):
+            try:
+                result = subprocess.run(
+                    command, capture_output=True, text=True, timeout=15
+                )
+                if result.returncode == 0:
+                    self.node.get_logger().info(f"Removed {name}")
+                    return
+                last_error = (result.stderr or result.stdout).strip()
+            except subprocess.TimeoutExpired as error:
+                last_error = f"timed out after {error.timeout} seconds"
+            if attempt < 4:
+                time.sleep(1)
+        raise RuntimeError(f"Unable to remove {name}: {last_error}")
 
     def pose(self, name):
         command = ["gz", "model", "-m", name, "-p"]
         result = None
         match = None
         for attempt in range(5):
-            result = subprocess.run(
-                command, capture_output=True, text=True, timeout=15
-            )
+            try:
+                result = subprocess.run(
+                    command, capture_output=True, text=True, timeout=15
+                )
+            except subprocess.TimeoutExpired:
+                if attempt < 4:
+                    time.sleep(0.2)
+                continue
             if result.returncode == 0:
                 match = re.search(
                     r"Pose \[ XYZ \(m\) \] \[ RPY \(rad\) \]:\s*"
@@ -205,28 +249,36 @@ class GazeboScene:
         }
 
     def link_pose(self, model_name, link_name):
-        result = subprocess.run(
-            ["gz", "model", "-m", model_name, "-l", link_name, "-p"],
-            capture_output=True,
-            text=True,
-            timeout=15,
-        )
-        if result.returncode != 0:
-            raise RuntimeError(
-                f"Unable to read pose for {model_name}/{link_name}: "
-                f"{result.stderr or result.stdout}"
-            )
-        link_block = re.search(
-            rf"- Name:\s*{re.escape(link_name)}\s.*?"
-            r"- Pose \[ XYZ \(m\) \] \[ RPY \(rad\) \]:\s*"
-            r"\[\s*([-+0-9.eE]+)\s+([-+0-9.eE]+)\s+([-+0-9.eE]+)\s*\]\s*"
-            r"\[\s*([-+0-9.eE]+)\s+([-+0-9.eE]+)\s+([-+0-9.eE]+)\s*\]",
-            result.stdout,
-            re.DOTALL,
-        )
+        command = ["gz", "model", "-m", model_name, "-l", link_name, "-p"]
+        result = None
+        link_block = None
+        for attempt in range(5):
+            try:
+                result = subprocess.run(
+                    command, capture_output=True, text=True, timeout=15
+                )
+            except subprocess.TimeoutExpired:
+                if attempt < 4:
+                    time.sleep(0.2)
+                continue
+            if result.returncode == 0:
+                link_block = re.search(
+                    rf"- Name:\s*{re.escape(link_name)}\s.*?"
+                    r"- Pose \[ XYZ \(m\) \] \[ RPY \(rad\) \]:\s*"
+                    r"\[\s*([-+0-9.eE]+)\s+([-+0-9.eE]+)\s+([-+0-9.eE]+)\s*\]\s*"
+                    r"\[\s*([-+0-9.eE]+)\s+([-+0-9.eE]+)\s+([-+0-9.eE]+)\s*\]",
+                    result.stdout,
+                    re.DOTALL,
+                )
+                if link_block is not None:
+                    break
+            if attempt < 4:
+                time.sleep(0.2)
         if link_block is None:
+            output = (result.stderr or result.stdout).strip() if result else ""
             raise RuntimeError(
-                f"Link pose output for {model_name}/{link_name} was not understood"
+                f"Unable to read link pose for {model_name}/{link_name} "
+                f"after 5 attempts: {output!r}"
             )
         values = [float(value) for value in link_block.groups()]
         return {
